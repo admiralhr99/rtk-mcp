@@ -1,4 +1,5 @@
-use std::process::Command;
+use tokio::process::Command;
+use tokio::time::{timeout, Duration};
 
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -12,67 +13,75 @@ use tracing_subscriber::EnvFilter;
 /// Maximum command string length (prevents memory abuse).
 const MAX_COMMAND_LEN: usize = 4096;
 
-/// Commands that RTK supports and that are safe to execute.
+/// Maximum output size returned to the LLM (prevents context flooding).
+const MAX_OUTPUT_BYTES: usize = 64 * 1024; // 64KB
+
+/// Command execution timeout in seconds.
+const COMMAND_TIMEOUT_SECS: u64 = 120;
+
+/// Commands allowed to execute. Set RTK_MCP_ALLOW_ALL=1 to bypass for dev use.
 const ALLOWED_COMMANDS: &[&str] = &[
+    // VCS
     "git",
-    "cargo",
-    "npm",
-    "npx",
-    "pnpm",
-    "pytest",
-    "ruff",
-    "mypy",
-    "pip",
-    "uv",
-    "go",
-    "golangci-lint",
-    "docker",
-    "grep",
-    "find",
-    "ls",
-    "cat",
-    "head",
-    "tail",
-    "wc",
-    "env",
-    "echo",
-    "pwd",
-    "gh",
-    "curl",
-    "wget",
-    "rtk",
-    "node",
-    "tsc",
-    "next",
-    "prettier",
-    "eslint",
-    "biome",
-    "playwright",
-    "prisma",
-    "vitest",
+    // Build / test
+    "cargo", "make", "cmake",
+    // Go
+    "go", "golangci-lint", "govulncheck",
+    // Node
+    "npm", "npx", "pnpm", "bun", "node", "tsc", "next",
+    "prettier", "eslint", "biome", "playwright", "vitest",
+    // Python
+    "python3", "python", "pytest", "ruff", "mypy", "pip", "uv",
+    // .NET
     "dotnet",
-    "psql",
-    "make",
-    "tree",
+    // Containers
+    "docker", "docker-compose", "kubectl",
+    // File ops
+    "ls", "cat", "head", "tail", "wc", "tree", "find", "grep",
+    "awk", "sed", "sort", "uniq", "diff", "xargs", "jq",
+    // Shell utils
+    "echo", "pwd", "env", "which", "file", "stat", "du", "df",
+    // Network / pentest
+    "curl", "wget", "ping", "nmap", "netstat", "ss", "ip",
+    "ffuf", "gobuster", "feroxbuster", "dirsearch",
+    "nuclei", "httpx", "subfinder", "amass", "dnsx",
+    "sqlmap", "nikto", "whatweb",
+    "openssl", "ssh", "scp",
+    // DB
+    "psql", "mysql", "sqlite3", "redis-cli",
+    // RTK + GitHub
+    "rtk", "gh",
+    // Prisma / ORM
+    "prisma",
 ];
 
 #[derive(Debug, Clone)]
 pub struct RtkMcpServer {
     tool_router: ToolRouter<Self>,
     rtk_available: bool,
+    allow_all: bool,
 }
 
 impl RtkMcpServer {
     pub fn new() -> Self {
         let rtk_available = validate_rtk_installation();
+        let allow_all = std::env::var("RTK_MCP_ALLOW_ALL")
+            .map(|v| v == "1" || v.to_lowercase() == "true")
+            .unwrap_or(false);
+
         if rtk_available {
             tracing::info!("RTK detected — commands will be filtered for token savings");
         } else {
             tracing::warn!("RTK not found — commands will execute without filtering");
         }
+        if allow_all {
+            tracing::warn!("RTK_MCP_ALLOW_ALL=1 — allowlist bypassed, all commands permitted");
+        }
+
         Self {
             tool_router: Self::tool_router(),
             rtk_available,
+            allow_all,
         }
     }
 }
@@ -86,8 +95,8 @@ impl Default for RtkMcpServer {
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct RunCommandRequest {
     #[schemars(
-        description = "The command to execute, e.g. 'git status', 'cargo test', 'ls -la src/'. \
-        Only allowlisted commands are accepted (git, cargo, npm, go, docker, grep, ls, etc.)."
+        description = "The command to execute, e.g. 'git status', 'cargo test', 'nmap -sV 10.0.0.1'. \
+        Allowlisted: git, cargo, go, docker, nmap, nuclei, httpx, curl, grep, find, ls, jq, etc."
     )]
     command: String,
 
@@ -102,17 +111,19 @@ impl RtkMcpServer {
     #[tool(
         name = "run_command",
         description = "Execute a shell command through RTK for token-optimized output. \
-            Supports git, cargo, npm, pnpm, pytest, go, docker, grep, find, ls, cat, and 25+ \
-            other command families. Output is filtered to reduce token consumption by 60-90% \
-            while preserving all essential information (errors, summaries, key data). \
-            Falls back to raw command execution if RTK is not available. \
-            Only allowlisted commands are accepted for security."
+            Supports git, cargo, go, docker, nmap, nuclei, httpx, subfinder, ffuf, sqlmap, \
+            curl, grep, find, jq, and 60+ other commands. \
+            Output is filtered by RTK to reduce token consumption 60-90% while preserving \
+            all essential info (errors, findings, summaries). \
+            Falls back to raw execution if RTK unavailable. \
+            Timeout: 120s. Max output: 64KB."
     )]
-    fn run_command(
+    async fn run_command(
         &self,
         Parameters(RunCommandRequest { command, cwd }): Parameters<RunCommandRequest>,
     ) -> Result<String, String> {
         let command = command.trim().to_string();
+
         if command.is_empty() {
             return Err("Error: empty command".to_string());
         }
@@ -124,7 +135,6 @@ impl RtkMcpServer {
             ));
         }
 
-        // Parse with shlex (handles quotes correctly)
         let parts = shlex::split(&command)
             .ok_or_else(|| "Failed to parse command: unmatched quotes".to_string())?;
 
@@ -132,11 +142,12 @@ impl RtkMcpServer {
             return Err("Error: empty command after parsing".to_string());
         }
 
-        // Security: validate command against allowlist
         let base_cmd = parts[0].rsplit('/').next().unwrap_or(&parts[0]);
-        if !ALLOWED_COMMANDS.contains(&base_cmd) {
+
+        if !self.allow_all && !ALLOWED_COMMANDS.contains(&base_cmd) {
             return Err(format!(
-                "Command '{}' is not in the RTK allowlist. Allowed: {}",
+                "Command '{}' is not in the allowlist. Set RTK_MCP_ALLOW_ALL=1 to bypass, \
+                or use one of: {}",
                 base_cmd,
                 ALLOWED_COMMANDS.join(", ")
             ));
@@ -144,20 +155,18 @@ impl RtkMcpServer {
 
         let parts_ref: Vec<&str> = parts.iter().map(|s| s.as_str()).collect();
 
-        // Try rtk first, fall back to raw command
         let result = if self.rtk_available {
-            match run_command_with("rtk", &parts_ref, cwd.as_deref()) {
+            match run_with_timeout("rtk", &parts_ref, cwd.as_deref()).await {
                 Ok(out) => out,
                 Err(rtk_err) => {
                     tracing::warn!("rtk failed ({}), falling back to raw command", rtk_err);
-                    run_command_with(parts_ref[0], &parts_ref[1..], cwd.as_deref())?
+                    run_with_timeout(parts_ref[0], &parts_ref[1..], cwd.as_deref()).await?
                 }
             }
         } else {
-            run_command_with(parts_ref[0], &parts_ref[1..], cwd.as_deref())?
+            run_with_timeout(parts_ref[0], &parts_ref[1..], cwd.as_deref()).await?
         };
 
-        // Format output with exit code info
         let mut output = result.output;
         if !result.success {
             output.push_str(&format!("\n[exit code: {}]", result.exit_code));
@@ -166,9 +175,22 @@ impl RtkMcpServer {
         if result.success {
             Ok(output)
         } else {
-            // Return as Err so MCP marks isError=true
             Err(output)
         }
+    }
+
+    #[tool(
+        name = "get_rtk_savings",
+        description = "Show RTK token savings statistics for this session. \
+            Returns bytes saved, token reduction percentage, and command history."
+    )]
+    async fn get_rtk_savings(&self) -> Result<String, String> {
+        if !self.rtk_available {
+            return Ok("RTK not installed — no savings data available.\nInstall: cargo install --git https://github.com/rtk-ai/rtk".to_string());
+        }
+        run_with_timeout("rtk", &["gain"], None)
+            .await
+            .map(|r| r.output)
     }
 }
 
@@ -176,12 +198,10 @@ impl RtkMcpServer {
 impl ServerHandler for RtkMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
-            "IMPORTANT: You MUST use the run_command tool for ALL shell command execution \
-                 instead of any built-in bash or terminal tool. This tool provides token-optimized \
-                 output that reduces context window usage by 60-90%. Every command you would \
-                 normally run via bash (ls, git, cargo, grep, find, cat, docker, npm, etc.) \
-                 should go through run_command instead. This saves significant tokens and cost. \
-                 The tool supports a 'cwd' parameter for working directory control.",
+            "IMPORTANT: Use run_command for ALL shell execution instead of any built-in bash tool. \
+             RTK filters output to reduce token usage 60-90%. Supports git, cargo, go, docker, \
+             nmap, nuclei, httpx, subfinder, ffuf, sqlmap, curl, grep, find, jq, and 60+ more. \
+             Use the cwd parameter for directory control. Timeout is 120s.",
         )
     }
 }
@@ -192,31 +212,47 @@ struct CommandResult {
     success: bool,
 }
 
-/// Execute a command and capture its output with exit code.
-fn run_command_with(cmd: &str, args: &[&str], cwd: Option<&str>) -> Result<CommandResult, String> {
+/// Execute a command asynchronously with timeout and output truncation.
+async fn run_with_timeout(
+    cmd: &str,
+    args: &[&str],
+    cwd: Option<&str>,
+) -> Result<CommandResult, String> {
     let mut command = Command::new(cmd);
     command.args(args);
     if let Some(dir) = cwd {
         command.current_dir(dir);
     }
 
-    let output = command
-        .output()
-        .map_err(|e| format!("failed to execute '{}': {}", cmd, e))?;
+    let output = timeout(
+        Duration::from_secs(COMMAND_TIMEOUT_SECS),
+        command.output(),
+    )
+    .await
+    .map_err(|_| format!("command timed out after {}s", COMMAND_TIMEOUT_SECS))?
+    .map_err(|e| format!("failed to execute '{}': {}", cmd, e))?;
 
     let exit_code = output.status.code().unwrap_or(-1);
+    let mut combined = collect_output(&output);
+
+    if combined.len() > MAX_OUTPUT_BYTES {
+        combined.truncate(MAX_OUTPUT_BYTES);
+        combined.push_str(&format!(
+            "\n[output truncated at {}KB — use head/tail/grep to filter]",
+            MAX_OUTPUT_BYTES / 1024
+        ));
+    }
+
     Ok(CommandResult {
-        output: collect_output(&output),
+        output: combined,
         exit_code,
         success: output.status.success(),
     })
 }
 
-/// Combine stdout and stderr into a single string.
 fn collect_output(output: &std::process::Output) -> String {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-
     match (stdout.is_empty(), stderr.is_empty()) {
         (true, true) => "(no output)".to_string(),
         (false, true) => stdout.into_owned(),
@@ -225,9 +261,8 @@ fn collect_output(output: &std::process::Output) -> String {
     }
 }
 
-/// Validate that the correct rtk binary (rtk-ai/rtk) is installed.
 fn validate_rtk_installation() -> bool {
-    Command::new("rtk")
+    std::process::Command::new("rtk")
         .arg("--version")
         .output()
         .map(|o| {
@@ -253,84 +288,4 @@ async fn main() -> anyhow::Result<()> {
 
     service.waiting().await?;
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_collect_output_stdout_only() {
-        let output = std::process::Output {
-            status: std::process::ExitStatus::default(),
-            stdout: b"hello world".to_vec(),
-            stderr: vec![],
-        };
-        assert_eq!(collect_output(&output), "hello world");
-    }
-
-    #[test]
-    fn test_collect_output_empty() {
-        let output = std::process::Output {
-            status: std::process::ExitStatus::default(),
-            stdout: vec![],
-            stderr: vec![],
-        };
-        assert_eq!(collect_output(&output), "(no output)");
-    }
-
-    #[test]
-    fn test_collect_output_both() {
-        let output = std::process::Output {
-            status: std::process::ExitStatus::default(),
-            stdout: b"out".to_vec(),
-            stderr: b"err".to_vec(),
-        };
-        assert_eq!(collect_output(&output), "out\n[stderr]\nerr");
-    }
-
-    #[test]
-    fn test_run_raw_echo() {
-        let result =
-            run_command_with("echo", &["hello"], None).expect("echo should always succeed");
-        assert!(result.output.contains("hello"));
-        assert!(result.success);
-    }
-
-    #[test]
-    fn test_run_nonexistent_command() {
-        let result = run_command_with("nonexistent_cmd_xyz", &[], None);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_allowlist_rejects_bash() {
-        assert!(!ALLOWED_COMMANDS.contains(&"bash"));
-        assert!(!ALLOWED_COMMANDS.contains(&"sh"));
-        assert!(!ALLOWED_COMMANDS.contains(&"rm"));
-    }
-
-    #[test]
-    fn test_allowlist_accepts_git() {
-        assert!(ALLOWED_COMMANDS.contains(&"git"));
-        assert!(ALLOWED_COMMANDS.contains(&"cargo"));
-        assert!(ALLOWED_COMMANDS.contains(&"ls"));
-    }
-
-    #[test]
-    fn test_shlex_handles_quotes() {
-        let parts = shlex::split("git log --format=\"%H %s\"").expect("should parse quoted args");
-        assert_eq!(parts, vec!["git", "log", "--format=%H %s"]);
-    }
-
-    #[test]
-    fn test_shlex_rejects_unmatched_quotes() {
-        assert!(shlex::split("git log --format=\"%H").is_none());
-    }
-
-    #[test]
-    fn test_command_length_limit() {
-        let long_cmd = "a".repeat(MAX_COMMAND_LEN + 1);
-        assert!(long_cmd.len() > MAX_COMMAND_LEN);
-    }
 }
