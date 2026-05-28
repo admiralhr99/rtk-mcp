@@ -155,7 +155,11 @@ impl RtkMcpServer {
 
         let parts_ref: Vec<&str> = parts.iter().map(|s| s.as_str()).collect();
 
-        let result = if self.rtk_available {
+        // Shell operators (|, &&, $VAR, etc.) require sh -c — RTK can't handle them directly.
+        // In that case skip RTK wrapping and go straight to sh -c execution.
+        let has_shell_ops = needs_shell(&command);
+
+        let result = if self.rtk_available && !has_shell_ops {
             match run_with_timeout("rtk", &parts_ref, cwd.as_deref()).await {
                 Ok(out) => out,
                 Err(rtk_err) => {
@@ -164,6 +168,7 @@ impl RtkMcpServer {
                 }
             }
         } else {
+            // shell ops → run_with_timeout detects them and wraps in sh -c automatically
             run_with_timeout(parts_ref[0], &parts_ref[1..], cwd.as_deref()).await?
         };
 
@@ -212,14 +217,45 @@ struct CommandResult {
     success: bool,
 }
 
+/// Returns true if the command string contains shell operators that require sh -c.
+fn needs_shell(cmd: &str) -> bool {
+    cmd.contains("&&")
+        || cmd.contains("||")
+        || cmd.contains(';')
+        || cmd.contains('|')
+        || cmd.contains('>')
+        || cmd.contains('<')
+        || cmd.contains('$')
+        || cmd.contains('*')
+        || cmd.contains('?')
+        || cmd.contains('~')
+        || cmd.contains('`')
+}
+
 /// Execute a command asynchronously with timeout and output truncation.
+/// If `full_cmd` is non-empty (shell mode), ignores cmd/args and runs via sh -c.
 async fn run_with_timeout(
     cmd: &str,
     args: &[&str],
     cwd: Option<&str>,
 ) -> Result<CommandResult, String> {
-    let mut command = Command::new(cmd);
-    command.args(args);
+    // Reconstruct full command string to check for shell operators
+    let full_cmd = if args.is_empty() {
+        cmd.to_string()
+    } else {
+        format!("{} {}", cmd, args.join(" "))
+    };
+
+    let mut command = if needs_shell(&full_cmd) {
+        let mut c = Command::new("sh");
+        c.args(["-c", &full_cmd]);
+        c
+    } else {
+        let mut c = Command::new(cmd);
+        c.args(args);
+        c
+    };
+
     if let Some(dir) = cwd {
         command.current_dir(dir);
     }
