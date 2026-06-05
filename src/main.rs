@@ -75,10 +75,11 @@ pub struct RtkMcpServer {
 impl RtkMcpServer {
     pub fn new() -> Self {
         let rtk_available = validate_rtk_installation();
-        // Default allow_all to true when RTK is present — RTK rewrite is the safety net.
+        // When RTK is present it acts as the safety net, so allow_all defaults to true.
+        // When RTK is absent the built-in allowlist is the only guard, so default to false.
         let allow_all = std::env::var("RTK_MCP_ALLOW_ALL")
             .map(|v| v == "1" || v.to_lowercase() == "true")
-            .unwrap_or(true);
+            .unwrap_or(rtk_available);
 
         if rtk_available {
             tracing::info!("RTK detected — commands will be routed through rtk rewrite");
@@ -279,15 +280,38 @@ struct CommandResult {
 /// Uses `rtk rewrite` — the single source of truth for RTK's hook logic.
 /// Returns `Some(rewritten)` when RTK has a filter (e.g. "rtk cargo test | grep FAILED"),
 /// `None` when RTK has no filter and the command should run directly.
+///
+/// # Why stdout-only (not merged stdout+stderr)
+/// `run_with_timeout` merges stdout and stderr into a single string.  If `rtk rewrite`
+/// ever emits a warning or update notice to stderr, the merged string would look like
+/// "rtk cargo test\n[stderr]\nWarning: …" — which would then be passed to `sh -c` and
+/// fail with a syntax error.  We capture stdout separately here.
+///
+/// # Why we don't check output.status.success()
+/// RTK exits with code 3 (not 0) when it successfully rewrites a command, and exits 1
+/// when it has no filter.  Checking `status.success()` would discard every valid rewrite.
+/// The correct signal is whether stdout is non-empty.
 async fn get_rtk_rewrite(command: &str) -> Option<String> {
-    let result = run_with_timeout("rtk", &["rewrite", command], None)
-        .await
-        .ok()?;
-    let output = result.output.trim().to_string();
-    if output.is_empty() || output == "(no output)" {
+    let timeout_secs = command_timeout_secs();
+    let mut cmd = Command::new("rtk");
+    cmd.args(["rewrite", command]);
+    cmd.stdin(std::process::Stdio::null()); // isolate from MCP transport fd
+    cmd.kill_on_drop(true);
+
+    let output = tokio::time::timeout(
+        tokio::time::Duration::from_secs(timeout_secs),
+        cmd.output(),
+    )
+    .await
+    .ok()? // timeout → None
+    .ok()?; // I/O error → None
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
         None
     } else {
-        Some(output)
+        Some(trimmed.to_string())
     }
 }
 
