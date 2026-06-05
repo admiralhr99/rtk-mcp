@@ -63,7 +63,7 @@ if [[ -d "$MCP_DIR" ]]; then
     cd "$MCP_DIR" && git pull --ff-only --quiet
 else
     echo "Cloning rtk-mcp..."
-    git clone --quiet https://github.com/ousamabenyounes/rtk-mcp.git "$MCP_DIR"
+    git clone --quiet https://github.com/admiralhr99/rtk-mcp.git "$MCP_DIR"
     cd "$MCP_DIR"
 fi
 
