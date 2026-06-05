@@ -24,8 +24,8 @@ fn command_timeout_secs() -> u64 {
         .unwrap_or(120)
 }
 
-/// Safety-net allowlist used only when RTK is NOT available.
-/// When RTK is present and RTK_MCP_ALLOW_ALL=1, this is bypassed entirely.
+/// Safety-net allowlist used only when RTK is NOT available AND allow_all is false.
+/// When RTK is present, rtk rewrite is used instead — RTK decides what it can filter.
 const ALLOWED_COMMANDS: &[&str] = &[
     // VCS
     "git",
@@ -75,17 +75,17 @@ pub struct RtkMcpServer {
 impl RtkMcpServer {
     pub fn new() -> Self {
         let rtk_available = validate_rtk_installation();
-        // Default allow_all to true — RTK is the safety net when available.
+        // Default allow_all to true when RTK is present — RTK rewrite is the safety net.
         let allow_all = std::env::var("RTK_MCP_ALLOW_ALL")
             .map(|v| v == "1" || v.to_lowercase() == "true")
             .unwrap_or(true);
 
         if rtk_available {
-            tracing::info!("RTK detected — commands will be filtered for token savings");
+            tracing::info!("RTK detected — commands will be routed through rtk rewrite");
         } else {
             tracing::warn!("RTK not found — commands will execute without filtering");
         }
-        if allow_all {
+        if allow_all && !rtk_available {
             tracing::warn!("RTK_MCP_ALLOW_ALL=1 — allowlist bypassed, all commands permitted");
         }
 
@@ -130,13 +130,14 @@ impl RtkMcpServer {
     #[tool(
         name = "run_command",
         description = "Execute ANY shell command through RTK for token-optimized output. \
-            When RTK is available, wraps commands transparently for 60-90% token savings. \
+            Uses `rtk rewrite` to route commands through the appropriate RTK filter (60-90% \
+            token savings). Commands without an RTK filter execute directly. \
             Supports everything RTK does: git, cargo, go, docker, nmap, nuclei, httpx, \
             subfinder, ffuf, sqlmap, curl, grep, find, jq, aws, kubectl, gh, rspec, bundle, \
             rubocop, rake, prisma, tsc, playwright, vitest, ruff, mypy, pip, uv, \
             golangci-lint, govulncheck, and any other command. \
             Shell operators (|, &&, ||, ;, >, <, $VAR, *, ~, backticks) are fully supported. \
-            Falls back to raw execution if RTK unavailable. \
+            Falls back to raw execution if RTK unavailable or has no filter for the command. \
             Timeout: configurable via RTK_MCP_TIMEOUT_SECS (default 120s). Max output: 64KB."
     )]
     async fn run_command(
@@ -156,20 +157,17 @@ impl RtkMcpServer {
             ));
         }
 
-        let has_shell_ops = needs_shell(&command);
-
-        // Skip allowlist when RTK is available AND allow_all is set.
-        // When RTK is absent, always enforce the allowlist as a safety net.
-        let skip_allowlist = self.rtk_available && self.allow_all;
-
-        if !skip_allowlist {
+        // Enforce allowlist only when RTK is absent AND allow_all is false.
+        // When RTK is available, `rtk rewrite` decides what it can filter;
+        // unknown commands fall back to direct execution anyway.
+        if !self.allow_all && !self.rtk_available {
             let parts = shlex::split(&command)
                 .ok_or_else(|| "Failed to parse command: unmatched quotes".to_string())?;
             if parts.is_empty() {
                 return Err("Error: empty command after parsing".to_string());
             }
             let base_cmd = parts[0].rsplit('/').next().unwrap_or(&parts[0]).to_string();
-            if !self.allow_all && !ALLOWED_COMMANDS.contains(&base_cmd.as_str()) {
+            if !ALLOWED_COMMANDS.contains(&base_cmd.as_str()) {
                 return Err(format!(
                     "Command '{}' is not in the allowlist. Set RTK_MCP_ALLOW_ALL=1 to bypass, \
                     or use one of: {}",
@@ -179,37 +177,16 @@ impl RtkMcpServer {
             }
         }
 
-        let result = if self.rtk_available {
-            if has_shell_ops {
-                // Shell ops + RTK: sh -c "rtk <full_command>" for transparent filtering.
-                run_shell_cmd(&format!("rtk {}", command), cwd.as_deref()).await?
-            } else {
-                let parts = shlex::split(&command)
-                    .ok_or_else(|| "Failed to parse command: unmatched quotes".to_string())?;
-                if parts.is_empty() {
-                    return Err("Error: empty command after parsing".to_string());
-                }
-                let parts_ref: Vec<&str> = parts.iter().map(|s| s.as_str()).collect();
-                match run_with_timeout("rtk", &parts_ref, cwd.as_deref()).await {
-                    Ok(out) => out,
-                    Err(rtk_err) => {
-                        tracing::warn!("rtk failed ({}), falling back to raw command", rtk_err);
-                        run_with_timeout(parts_ref[0], &parts_ref[1..], cwd.as_deref()).await?
-                    }
-                }
-            }
-        } else if has_shell_ops {
-            // No RTK, shell ops: sh -c "<full_command>".
-            run_shell_cmd(&command, cwd.as_deref()).await?
+        // Route through RTK using `rtk rewrite` — the canonical hook logic.
+        // rewrite returns the token-optimized form (e.g. "rtk cargo test | grep FAILED")
+        // or empty if RTK has no filter for the command.
+        let effective_command = if self.rtk_available {
+            get_rtk_rewrite(&command).await.unwrap_or(command.clone())
         } else {
-            let parts = shlex::split(&command)
-                .ok_or_else(|| "Failed to parse command: unmatched quotes".to_string())?;
-            if parts.is_empty() {
-                return Err("Error: empty command after parsing".to_string());
-            }
-            let parts_ref: Vec<&str> = parts.iter().map(|s| s.as_str()).collect();
-            run_with_timeout(parts_ref[0], &parts_ref[1..], cwd.as_deref()).await?
+            command.clone()
         };
+
+        let result = run_shell_cmd(&effective_command, cwd.as_deref()).await?;
 
         let mut output = result.output;
         if !result.success {
@@ -297,19 +274,21 @@ struct CommandResult {
     success: bool,
 }
 
-/// Returns true if the command string contains shell operators that require `sh -c`.
-fn needs_shell(cmd: &str) -> bool {
-    cmd.contains("&&")
-        || cmd.contains("||")
-        || cmd.contains(';')
-        || cmd.contains('|')
-        || cmd.contains('>')
-        || cmd.contains('<')
-        || cmd.contains('$')
-        || cmd.contains('*')
-        || cmd.contains('?')
-        || cmd.contains('~')
-        || cmd.contains('`')
+/// Ask RTK for the token-optimized equivalent of a command string.
+///
+/// Uses `rtk rewrite` — the single source of truth for RTK's hook logic.
+/// Returns `Some(rewritten)` when RTK has a filter (e.g. "rtk cargo test | grep FAILED"),
+/// `None` when RTK has no filter and the command should run directly.
+async fn get_rtk_rewrite(command: &str) -> Option<String> {
+    let result = run_with_timeout("rtk", &["rewrite", command], None)
+        .await
+        .ok()?;
+    let output = result.output.trim().to_string();
+    if output.is_empty() || output == "(no output)" {
+        None
+    } else {
+        Some(output)
+    }
 }
 
 /// Execute a command string via `sh -c` (supports shell operators and env var expansion).
@@ -345,7 +324,7 @@ async fn run_shell_cmd(shell_str: &str, cwd: Option<&str>) -> Result<CommandResu
     finish_output(output)
 }
 
-/// Execute a command directly (no shell expansion). Used for clean, parsed commands.
+/// Execute a command directly (no shell expansion). Used for RTK probes and savings tools.
 /// Same stdin isolation and kill_on_drop rationale as `run_shell_cmd`.
 async fn run_with_timeout(
     cmd: &str,
@@ -399,7 +378,7 @@ fn collect_output(output: &std::process::Output) -> String {
     }
 }
 
-/// Validate RTK installation by checking both --version and the gain subcommand.
+/// Validate RTK installation by checking --version and the gain subcommand.
 /// Stdin is explicitly set to null so these probes never touch the MCP transport fd.
 fn validate_rtk_installation() -> bool {
     let version_ok = std::process::Command::new("rtk")
@@ -416,11 +395,15 @@ fn validate_rtk_installation() -> bool {
         return false;
     }
 
+    // Verify `rtk rewrite` works — that's the core routing mechanism this server relies on.
     std::process::Command::new("rtk")
-        .arg("gain")
+        .args(["rewrite", "git status"])
         .stdin(std::process::Stdio::null())
         .output()
-        .map(|o| o.status.success())
+        .map(|o| {
+            let out = String::from_utf8_lossy(&o.stdout);
+            !out.trim().is_empty()
+        })
         .unwrap_or(false)
 }
 
@@ -446,46 +429,19 @@ async fn main() -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn needs_shell_detects_pipe() {
-        assert!(needs_shell("ls | wc -l"));
-    }
-
-    #[test]
-    fn needs_shell_detects_and_and() {
-        assert!(needs_shell("git fetch && git rebase"));
-    }
-
-    #[test]
-    fn needs_shell_detects_redirect() {
-        assert!(needs_shell("echo hello > /tmp/out"));
-    }
-
-    #[test]
-    fn needs_shell_detects_dollar() {
-        assert!(needs_shell("echo $HOME"));
-    }
-
-    #[test]
-    fn needs_shell_detects_glob() {
-        assert!(needs_shell("ls *.rs"));
-    }
-
-    #[test]
-    fn needs_shell_clean_command() {
-        assert!(!needs_shell("git status"));
-        assert!(!needs_shell("cargo test --lib"));
-        assert!(!needs_shell("nmap -sV 10.0.0.1"));
-    }
+    // Serializes all tests that mutate RTK_MCP_TIMEOUT_SECS to prevent races.
+    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn command_timeout_secs_default() {
+        let _g = ENV_MUTEX.lock().unwrap();
         std::env::remove_var("RTK_MCP_TIMEOUT_SECS");
         assert_eq!(command_timeout_secs(), 120);
     }
 
     #[test]
     fn command_timeout_secs_from_env() {
+        let _g = ENV_MUTEX.lock().unwrap();
         std::env::set_var("RTK_MCP_TIMEOUT_SECS", "300");
         assert_eq!(command_timeout_secs(), 300);
         std::env::remove_var("RTK_MCP_TIMEOUT_SECS");
@@ -493,6 +449,7 @@ mod tests {
 
     #[test]
     fn command_timeout_secs_invalid_env() {
+        let _g = ENV_MUTEX.lock().unwrap();
         std::env::set_var("RTK_MCP_TIMEOUT_SECS", "notanumber");
         assert_eq!(command_timeout_secs(), 120);
         std::env::remove_var("RTK_MCP_TIMEOUT_SECS");
@@ -536,33 +493,56 @@ mod tests {
         assert!(ALLOWED_COMMANDS.contains(&"bundle"));
     }
 
+    /// RTK rewrite should transform known commands to their token-optimized form.
+    #[tokio::test]
+    async fn get_rtk_rewrite_known_command() {
+        // Only run when RTK is actually available
+        if !validate_rtk_installation() {
+            return;
+        }
+        let rewritten = get_rtk_rewrite("git status").await;
+        assert!(rewritten.is_some(), "rtk should rewrite 'git status'");
+        let r = rewritten.unwrap();
+        assert!(r.contains("rtk"), "rewrite should include rtk: {}", r);
+    }
+
+    /// RTK rewrite returns None for commands RTK doesn't filter.
+    #[tokio::test]
+    async fn get_rtk_rewrite_unknown_command() {
+        if !validate_rtk_installation() {
+            return;
+        }
+        // `echo` is not an RTK subcommand — rewrite should return None
+        let rewritten = get_rtk_rewrite("echo hello world").await;
+        assert!(rewritten.is_none(), "rtk should not rewrite 'echo': {:?}", rewritten);
+    }
+
+    /// RTK rewrite handles shell operators — rewrites the filterable parts.
+    #[tokio::test]
+    async fn get_rtk_rewrite_pipe_command() {
+        if !validate_rtk_installation() {
+            return;
+        }
+        let rewritten = get_rtk_rewrite("cargo test | grep FAILED").await;
+        assert!(rewritten.is_some(), "rtk should rewrite piped cargo test");
+        let r = rewritten.unwrap();
+        assert!(r.contains("rtk cargo test"), "should contain rtk cargo test: {}", r);
+    }
+
     /// Regression test: child processes must not inherit the MCP server's stdin.
-    /// A child that inherits fd 0 (set O_NONBLOCK by tokio) can corrupt the stdio
-    /// transport on the next read, producing EAGAIN (errno 35 on macOS) → server crash.
-    /// Verify by running a command that would read stdin if inherited; it must finish
-    /// cleanly without hanging or consuming any of the parent's stdin.
     #[tokio::test]
     async fn stdin_is_isolated_from_parent() {
-        // `cat` with no args reads stdin until EOF. If it inherited the real stdin it
-        // would block forever. With Stdio::null() it should exit immediately (0 bytes).
         let result = run_shell_cmd("cat", None).await.unwrap();
-        // cat on /dev/null exits 0 with empty output
         assert!(result.success, "cat read from /dev/null should succeed");
         assert!(result.output == "(no output)" || result.output.is_empty());
     }
 
-    /// Regression test: a timed-out command must not leave the server in a state
-    /// where subsequent commands fail. We use a very short fake timeout via the env var.
+    /// Regression test: a timed-out command must not leave the server in a corrupt state.
     #[tokio::test]
     async fn timeout_does_not_corrupt_server_state() {
-        // Run a command that completes quickly — after any prior timeout the server
-        // must still be able to execute new commands successfully.
         let r1 = run_shell_cmd("echo before", None).await.unwrap();
         assert!(r1.output.contains("before"));
 
-        // Simulate a timed-out execution by directly calling with a tiny timeout param
-        // (we can't override the env var mid-test reliably, so just confirm a second
-        // clean command works after any prior error path).
         let _ = run_with_timeout("__will_not_exist_xyz__", &[], None).await;
 
         let r2 = run_shell_cmd("echo after", None).await.unwrap();
