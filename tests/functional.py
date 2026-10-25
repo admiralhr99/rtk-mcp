@@ -2,6 +2,10 @@
 """End-to-end test of the rtk-mcp binary over real MCP stdio.
 
 usage: python3 tests/functional.py [path/to/rtk-mcp]     (default: target/release/rtk-mcp[.exe])
+       python tests/functional.py path/to/rtk-mcp.exe --installed [claude_desktop_config.json]
+
+The second form checks what install.ps1 leaves behind (an rtk.exe beside the server, RTK not on
+PATH, and the Claude Desktop config it edited) instead of running the whole suite.
 
 Runs on Linux, macOS and Windows. On Windows the shared tests run under Git Bash (the shell the
 server picks when Git for Windows is installed) and a section of their own covers cmd.exe.
@@ -28,9 +32,9 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 IS_WINDOWS = os.name == "nt"
-BINARY = os.path.abspath(
-    sys.argv[1] if len(sys.argv) > 1 else "target/release/rtk-mcp" + (".exe" if IS_WINDOWS else "")
-)
+ARGS = [a for a in sys.argv[1:] if not a.startswith("--")]
+INSTALLED = "--installed" in sys.argv[1:]  # check an install.ps1 layout instead of running everything
+BINARY = os.path.abspath(ARGS[0] if ARGS else "target/release/rtk-mcp" + (".exe" if IS_WINDOWS else ""))
 FAILURES = []
 
 # Things that differ between a POSIX shell on Linux/macOS and Git Bash on Windows.
@@ -750,10 +754,49 @@ def test_windows(version, bash_path):
         shutil.rmtree(folder, ignore_errors=True)
 
 
+def test_installed(config_path):
+    """What install.ps1 leaves behind: rtk.exe beside the server, nothing about RTK on PATH, and a
+    Claude Desktop config that kept what it had (the workflow seeds `theme` and a server `other`)."""
+    check("rtk.exe sits beside the server", os.path.isfile(os.path.join(os.path.dirname(BINARY), "rtk.exe")))
+    s = Server(path=BASIC_PATH)
+    try:
+        check("the server finds the RTK installed beside it",
+              "detected" in s.log() and "RTK not found" not in s.log(), s.log()[-300:])
+        err, text = s.call("run_command", command="rtk --version")
+        check("commands it runs find that RTK too", not err and text.startswith("rtk "), text)
+        err, text = s.call("run_command", command="echo installed")
+        check("a command runs", not err and "installed" in text, text)
+        err, text = s.call("get_rtk_savings")
+        check("the stats tools work", not err and text.strip() != "" and "RTK not installed" not in text, text)
+    finally:
+        s.close()
+    if config_path:
+        with open(config_path, encoding="utf-8-sig") as f:
+            config = json.load(f)
+        servers = config.get("mcpServers", {})
+        command = servers.get("rtk", {}).get("command", "")
+        check("config: rtk points at the installed server",
+              os.path.normcase(os.path.normpath(command)) == os.path.normcase(BINARY), servers.get("rtk"))
+        check("config: the other server is kept as it was",
+              servers.get("other") == {"command": "x", "args": ["a"]}, servers.get("other"))
+        check("config: the rest of the file is kept", config.get("theme") == "dark", config)
+        backups = [n for n in os.listdir(os.path.dirname(config_path))
+                   if n.startswith(os.path.basename(config_path) + ".bak-")]
+        check("config: a backup of the old file was made", len(backups) >= 1, os.listdir(os.path.dirname(config_path)))
+
+
 def main():
     if not os.access(BINARY, os.X_OK):
         print("binary not found: " + BINARY)
         return 2
+    if INSTALLED:
+        test_installed(ARGS[1] if len(ARGS) > 1 else None)
+        print()
+        if FAILURES:
+            print("%d FAILED: %s" % (len(FAILURES), "; ".join(FAILURES)))
+            return 1
+        print("The installation checks passed")
+        return 0
     version = rtk_version()
     print("rtk-mcp: %s\nrtk: %s\n" % (BINARY, ".".join(map(str, version)) if version else "not installed"))
     posix, bash_path = True, None
