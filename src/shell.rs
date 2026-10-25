@@ -20,6 +20,19 @@ use std::sync::OnceLock;
 /// such as Claude Desktop would see a window flash up for every command.
 pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
+/// The first argument that turns this executable into the `cmd.exe` launcher
+/// ([`run_cmd_launcher`]) instead of the server.
+pub const CMD_LAUNCHER_ARG: &str = "--rtk-mcp-cmd-launcher";
+
+/// The executable the server has registered as the launcher of `cmd.exe` commands.
+static CMD_LAUNCHER: OnceLock<PathBuf> = OnceLock::new();
+
+/// Send commands for `cmd.exe` through `exe`, which is this very executable started with
+/// [`CMD_LAUNCHER_ARG`]. See [`cmd_command`] for why. Without it `cmd.exe` is started directly.
+pub fn use_cmd_launcher(exe: PathBuf) {
+    let _ = CMD_LAUNCHER.set(exe);
+}
+
 /// The shell that runs a command string.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Shell {
@@ -145,32 +158,105 @@ impl Shell {
     }
 }
 
-/// `cmd.exe /D /S /C "chcp 65001 >nul & <line>"`.
+/// A command that runs `line` under `cmd`, the path of `cmd.exe`.
 ///
-/// `/D` skips AutoRun commands, and `/S` makes cmd strip exactly the outer quotes added here, so
-/// `line` reaches it untouched (`raw_arg`: no Rust quoting on top). `chcp 65001` switches the
-/// console to UTF-8 so non-ASCII output survives. cmd has no `NAME=value command` prefix, so those
-/// words (`RTK_DISABLED=1 git status`) are moved into the environment instead.
+/// `cmd.exe` converts the text of its own commands (`echo`, `dir`, `set`) to the console's code
+/// page, and it reads that code page once, when it starts: a `chcp 65001` earlier on the same
+/// command line is too late for it, and every non-ASCII character comes out as `?`. So the command
+/// goes through the launcher ([`run_cmd_launcher`], this very executable), which switches the
+/// console to UTF-8 first and starts `cmd.exe` after that. If the launcher is not there (a test, or
+/// an executable that has since been replaced) `cmd.exe` is started directly with the `chcp` in
+/// front, which still gives UTF-8 to the programs it runs but leaves its own commands in the OEM
+/// code page.
+///
+/// cmd has no `NAME=value command` prefix, so those words (`RTK_DISABLED=1 git status`) are moved
+/// into the environment instead.
 fn cmd_command(cmd: &Path, line: &str) -> Command {
+    cmd_command_with(
+        CMD_LAUNCHER
+            .get()
+            .filter(|exe| exe.is_file())
+            .map(PathBuf::as_path),
+        cmd,
+        line,
+    )
+}
+
+/// [`cmd_command`] with the launcher given (`None`: start `cmd.exe` directly).
+fn cmd_command_with(launcher: Option<&Path>, cmd: &Path, line: &str) -> Command {
     let (assignments, rest) = split_env_prefix(line);
-    let mut command = Command::new(cmd);
-    command.args(["/D", "/S", "/C"]);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.raw_arg(cmd_script(rest));
-    }
-    #[cfg(not(windows))]
-    command.arg(cmd_script(rest));
+    let mut command = match launcher {
+        Some(exe) => {
+            let mut command = Command::new(exe);
+            command.arg(CMD_LAUNCHER_ARG).arg(cmd).arg(rest);
+            command
+        }
+        None => {
+            let mut command = Command::new(cmd);
+            command.args(["/D", "/S", "/C"]);
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                command.raw_arg(cmd_script(rest));
+            }
+            #[cfg(not(windows))]
+            command.arg(cmd_script(rest));
+            command
+        }
+    };
     for (name, value) in assignments {
         command.env(name, value);
     }
     command
 }
 
-/// The argument that follows `/S /C`.
+/// The argument that follows `/S /C` when `cmd.exe` is started directly: `/D` skips AutoRun
+/// commands, and `/S` makes cmd strip exactly the outer quotes added here, so `line` reaches it
+/// untouched (`raw_arg`: no Rust quoting on top).
 fn cmd_script(line: &str) -> String {
     format!("\"chcp 65001 >nul & {}\"", line)
+}
+
+/// The argument that follows `/S /C` once the launcher has set the code page itself.
+fn launcher_script(line: &OsStr) -> OsString {
+    let mut script = OsString::from("\"");
+    script.push(line);
+    script.push("\"");
+    script
+}
+
+/// What `rtk-mcp --rtk-mcp-cmd-launcher <cmd.exe> <line>` does: switch the console this process
+/// has to UTF-8, run `line` under `cmd`, and exit with its exit code.
+///
+/// The server starts this with `CREATE_NO_WINDOW`, which gives the process a new, hidden console in
+/// the system's OEM code page (437, 850, ...). `cmd.exe` inherits the console and the standard
+/// handles, so it starts in UTF-8 and its output reaches the server as UTF-8.
+#[cfg(windows)]
+pub fn run_cmd_launcher(cmd: &OsStr, line: &OsStr) -> i32 {
+    use std::os::windows::process::CommandExt;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn SetConsoleOutputCP(code_page: u32) -> i32;
+        fn SetConsoleCP(code_page: u32) -> i32;
+    }
+    // SAFETY: two calls that take a number and no pointers; without a console they fail and
+    // change nothing.
+    unsafe {
+        SetConsoleOutputCP(65001);
+        SetConsoleCP(65001);
+    }
+    match Command::new(cmd)
+        .args(["/D", "/S", "/C"])
+        .raw_arg(launcher_script(line))
+        .status()
+    {
+        Ok(status) => status.code().unwrap_or(1),
+        Err(e) => {
+            eprintln!("failed to execute {}: {e}", Path::new(cmd).display());
+            127
+        }
+    }
 }
 
 /// The leading `NAME=value` words of a POSIX-style command line, and the rest of the line.
@@ -633,12 +719,50 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn cmd_command_arguments_and_environment() {
-        let command = cmd_command(Path::new("cmd.exe"), "RTK_DISABLED=1 git status");
+        let command = cmd_command_with(None, Path::new("cmd.exe"), "RTK_DISABLED=1 git status");
         assert_eq!(command.get_program(), "cmd.exe");
         let args: Vec<_> = command.get_args().collect();
         assert_eq!(args, ["/D", "/S", "/C", "\"chcp 65001 >nul & git status\""]);
         let env: Vec<_> = command.get_envs().collect();
         assert_eq!(env, [(OsStr::new("RTK_DISABLED"), Some(OsStr::new("1")))]);
+    }
+
+    #[test]
+    fn the_launcher_gets_cmd_and_the_line_as_two_arguments() {
+        let command = cmd_command_with(
+            Some(Path::new("rtk-mcp.exe")),
+            Path::new("cmd.exe"),
+            r#"RTK_DISABLED=1 findstr "a b" f.txt & echo 日本語"#,
+        );
+        assert_eq!(command.get_program(), "rtk-mcp.exe");
+        let args: Vec<_> = command.get_args().collect();
+        assert_eq!(
+            args,
+            [
+                CMD_LAUNCHER_ARG,
+                "cmd.exe",
+                r#"findstr "a b" f.txt & echo 日本語"#
+            ],
+            "the line is one argument, without its NAME=value prefix"
+        );
+        let env: Vec<_> = command.get_envs().collect();
+        assert_eq!(env, [(OsStr::new("RTK_DISABLED"), Some(OsStr::new("1")))]);
+    }
+
+    #[test]
+    fn the_launcher_hands_cmd_the_line_in_the_quotes_that_slash_s_strips() {
+        assert_eq!(launcher_script(OsStr::new("dir")), "\"dir\"");
+        assert_eq!(
+            launcher_script(OsStr::new(r#"findstr "a b" f.txt"#)),
+            r#""findstr "a b" f.txt""#
+        );
+    }
+
+    #[test]
+    fn without_a_registered_launcher_cmd_is_started_directly() {
+        // `use_cmd_launcher` is never called in the unit tests, so this is what they all get
+        let command = cmd_command(Path::new("cmd.exe"), "echo hi");
+        assert_eq!(command.get_program(), "cmd.exe");
     }
 
     #[test]

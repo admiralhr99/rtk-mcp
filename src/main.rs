@@ -822,6 +822,17 @@ fn child_env(command: &mut Command) {
     if std::env::var_os("RTK_SUPPRESS_HOOK_WARNING").is_none() {
         command.env("RTK_SUPPRESS_HOOK_WARNING", "1");
     }
+    // Windows: Python encodes what it writes to a pipe in the ANSI code page, and fails with a
+    // UnicodeEncodeError on the first character outside it. The output is read as UTF-8.
+    #[cfg(windows)]
+    if std::env::var_os("PYTHONIOENCODING").is_none()
+        && !command.as_std().get_envs().any(|(key, _)| {
+            key.to_str()
+                .is_some_and(|k| k.eq_ignore_ascii_case("PYTHONIOENCODING"))
+        })
+    {
+        command.env("PYTHONIOENCODING", "utf-8");
+    }
     // Windows: an rtk.exe installed next to rtk-mcp.exe has to be found by the shell as well. The
     // PATH to extend is the one the command already carries (a POSIX shell's tools directory is put
     // there by `Shell::command`), else this process's own.
@@ -1170,8 +1181,39 @@ fn detect_rtk() -> Option<String> {
     }
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    // Windows: this executable is also the launcher of cmd.exe commands (`shell::run_cmd_launcher`),
+    // which has to run before anything of the server starts.
+    #[cfg(windows)]
+    {
+        let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+        if args
+            .get(1)
+            .is_some_and(|arg| arg == shell::CMD_LAUNCHER_ARG)
+        {
+            let code = match (args.get(2), args.get(3)) {
+                (Some(cmd), Some(line)) => shell::run_cmd_launcher(cmd, line),
+                _ => {
+                    eprintln!(
+                        "usage: rtk-mcp {} <cmd.exe> <command line>",
+                        shell::CMD_LAUNCHER_ARG
+                    );
+                    2
+                }
+            };
+            std::process::exit(code);
+        }
+        if let Ok(exe) = std::env::current_exe() {
+            shell::use_cmd_launcher(exe);
+        }
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(serve())
+}
+
+async fn serve() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()))
         .with_writer(std::io::stderr)
@@ -2322,12 +2364,44 @@ mod tests {
             assert_eq!(set.output.trim(), "[42]");
         }
 
-        #[tokio::test]
-        async fn cmd_output_is_utf8() {
-            let result = run_in_shell(&Shell::cmd(), "echo héllo 日本語", None)
-                .await
-                .unwrap();
-            assert_eq!(result.output.trim(), "héllo 日本語");
+        /// Not a test. The `cmd.exe` launcher as a process of its own: this test binary run on its
+        /// own (`--ignored`), running $RTK_MCP_TEST_LAUNCH_LINE the way `rtk-mcp.exe
+        /// --rtk-mcp-cmd-launcher` does.
+        #[test]
+        #[ignore = "helper process of cmd_launcher_prints_utf8"]
+        fn helper_cmd_launcher() {
+            if let Some(line) = std::env::var_os("RTK_MCP_TEST_LAUNCH_LINE") {
+                let Shell::Cmd(cmd) = Shell::cmd() else {
+                    unreachable!("Shell::cmd is cmd.exe")
+                };
+                std::process::exit(shell::run_cmd_launcher(cmd.as_os_str(), &line));
+            }
+        }
+
+        /// What cmd.exe prints for its own commands is in the code page of the console it starts
+        /// in, so the launcher sets it before it starts cmd. `CREATE_NO_WINDOW` gives the launcher
+        /// a new console in the OEM code page, as it has when the server starts it: the case that
+        /// matters.
+        #[test]
+        fn cmd_launcher_prints_utf8_and_passes_the_exit_code() {
+            use std::os::windows::process::CommandExt;
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "tests::windows_only::helper_cmd_launcher",
+                ])
+                .env(
+                    "RTK_MCP_TEST_LAUNCH_LINE",
+                    "echo héllo 日本語 العربية& exit /b 7",
+                )
+                .stdin(Stdio::null())
+                .creation_flags(shell::CREATE_NO_WINDOW)
+                .output()
+                .expect("the launcher runs");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(stdout.contains("héllo 日本語 العربية"), "{stdout:?}");
+            assert_eq!(output.status.code(), Some(7), "{stdout:?}");
         }
 
         #[tokio::test]

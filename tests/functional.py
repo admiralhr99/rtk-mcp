@@ -386,10 +386,17 @@ def test_runtime_robustness():
         err, text = s.call("run_command", command="echo alive")
         check("server alive after truncation", not err and "alive" in text, text)
 
-        err, text = s.call("run_command", command="head -c 30000000 /dev/zero | tr '\\0' x")
-        check("30MB of output is handled (capped, not buffered)", not err and "[output truncated" in text, text[-120:])
         err, text = s.call("run_command", command="cat")
         check("stdin of children is isolated", not err and text == "(no output)", text)
+    finally:
+        s.close()
+
+    # A server of its own: this check is about memory, not time, and BSD `tr` on a busy CI runner
+    # needs longer than the 2s timeout above.
+    s = Server(extra_env={"RTK_MCP_MAX_OUTPUT_KB": "64"})
+    try:
+        err, text = s.call("run_command", command="head -c 30000000 /dev/zero | tr '\\0' x")
+        check("30MB of output is handled (capped, not buffered)", not err and "[output truncated" in text, text[-120:])
     finally:
         s.close()
 
@@ -590,6 +597,15 @@ def test_windows(version, bash_path):
             err, text = s.call("run_command", command="cmd //c exit 7")
             check("auto: a native program's exit code comes through Git Bash",
                   err and "[exit code: 7]" in text, text)
+            utf8_script = os.path.join(s.project, "utf8.py")
+            with open(utf8_script, "w", encoding="utf-8") as f:
+                f.write("print('héllo 日本語 العربية')\n")
+            err, text = s.call("run_command", command="'%s' utf8.py" % sh_path(sys.executable), cwd=s.project)
+            check("auto: Python can print outside the ANSI code page (PYTHONIOENCODING)",
+                  not err and "héllo 日本語 العربية" in text, text)
+            err, text = s.call("run_command", command="echo héllo 日本語 العربية")
+            check("auto: Git Bash echoes French, Japanese and Arabic as typed",
+                  not err and "héllo 日本語 العربية" in text, text)
         finally:
             s.close()
 
@@ -630,6 +646,21 @@ def test_windows(version, bash_path):
         check("cmd: pipes work", not err and "abc" in text, text)
         err, text = s.call("run_command", command="echo 日本語")
         check("cmd: non-ASCII output survives (UTF-8 code page)", not err and "日本語" in text, text)
+        err, text = s.call("run_command", command="echo héllo 日本語 العربية")
+        check("cmd: echo prints French, Japanese and Arabic as typed",
+              not err and "héllo 日本語 العربية" in text, text)
+        odd_names = ("日本語.txt", "héllo.txt", "العربية.txt")
+        for name in odd_names:
+            open(os.path.join(s.project, name), "w").write(name)
+        err, text = s.call("run_command", command="dir /b", cwd=s.project)
+        check("cmd: dir shows file names outside the OEM code page",
+              not err and all(name in text for name in odd_names), text)
+        utf8_script = os.path.join(s.project, "utf8.py")
+        with open(utf8_script, "w", encoding="utf-8") as f:
+            f.write("print('héllo 日本語 العربية')\n")
+        err, text = s.call("run_command", command='"%s" utf8.py' % sys.executable, cwd=s.project)
+        check("cmd: Python can print outside the ANSI code page (PYTHONIOENCODING)",
+              not err and "héllo 日本語 العربية" in text, text)
         err, text = s.call("run_command", command="exit 3")
         check("cmd: a non-zero exit is an error with the code", err and "[exit code: 3]" in text, text)
         err, text = s.call("run_command", command='powershell -NoProfile -Command "Write-Output ps-ok"')
