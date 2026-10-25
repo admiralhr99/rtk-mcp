@@ -1,6 +1,6 @@
 [package]
 name = "rtk-mcp"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.89"
 description = "MCP server bridge for RTK (Rust Token Killer) — exposes token-optimized CLI filtering to any MCP-compatible client"
