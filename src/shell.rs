@@ -443,6 +443,31 @@ fn bundled_rtk_dir_of(exe: &Path) -> Option<PathBuf> {
     dir.join("rtk.exe").is_file().then(|| dir.to_path_buf())
 }
 
+/// The program a command line starts with, as written, for the allowlist.
+///
+/// On Linux and macOS that is the first word under POSIX quoting rules. On Windows the first word
+/// is often a path with backslashes (`C:\Windows\System32\hostname.exe`,
+/// `"C:\Program Files\Git\cmd\git.exe" status`), which POSIX splitting would eat, so there the word
+/// ends at the first white space, or at the closing quote of a quoted one, and nothing is unescaped.
+pub fn program_of(command: &str, windows: bool) -> Result<String, String> {
+    const EMPTY: &str = "Error: empty command after parsing";
+    if windows {
+        let line = command.trim_start();
+        let word = match line.chars().next() {
+            Some(quote @ ('"' | '\'')) => line[1..].split(quote).next().unwrap_or_default(),
+            _ => line.split_whitespace().next().unwrap_or_default(),
+        };
+        return if word.is_empty() {
+            Err(EMPTY.to_string())
+        } else {
+            Ok(word.to_string())
+        };
+    }
+    let parts = shlex::split(command)
+        .ok_or_else(|| "Failed to parse command: unmatched quotes".to_string())?;
+    parts.into_iter().next().ok_or_else(|| EMPTY.to_string())
+}
+
 /// The command name in the first word of a command line, for the allowlist: no directory, and on
 /// Windows no `.exe` and no case.
 pub fn base_command(first: &str, windows: bool) -> String {
@@ -868,6 +893,70 @@ mod tests {
         assert_eq!(base_command("dir", true), "dir");
         assert_eq!(base_command(".exe", true), "");
         assert_eq!(base_command("x", true), "x");
+    }
+
+    #[test]
+    fn program_of_a_command_line_on_unix() {
+        let program = |line| program_of(line, false);
+        assert_eq!(program("git status"), Ok("git".to_string()));
+        assert_eq!(
+            program("  /usr/bin/git  status"),
+            Ok("/usr/bin/git".to_string())
+        );
+        assert_eq!(program("'my tool' --x"), Ok("my tool".to_string()));
+        assert_eq!(program("\"a b\" c"), Ok("a b".to_string()));
+        // POSIX rules: an unquoted backslash escapes the next character
+        assert_eq!(program("a\\ b c"), Ok("a b".to_string()));
+        assert_eq!(
+            program("echo \"unterminated"),
+            Err("Failed to parse command: unmatched quotes".to_string())
+        );
+        assert_eq!(
+            program(""),
+            Err("Error: empty command after parsing".to_string())
+        );
+    }
+
+    #[test]
+    fn program_of_a_command_line_on_windows_keeps_backslashes() {
+        let program = |line| program_of(line, true);
+        assert_eq!(program("dir /b"), Ok("dir".to_string()));
+        assert_eq!(program("  dir"), Ok("dir".to_string()));
+        assert_eq!(
+            program("C:\\Windows\\System32\\HOSTNAME.EXE /all"),
+            Ok("C:\\Windows\\System32\\HOSTNAME.EXE".to_string())
+        );
+        assert_eq!(
+            program("\"C:\\Program Files\\Git\\cmd\\git.exe\" status"),
+            Ok("C:\\Program Files\\Git\\cmd\\git.exe".to_string())
+        );
+        assert_eq!(
+            program("'C:/Program Files/Git/cmd/git.exe' status"),
+            Ok("C:/Program Files/Git/cmd/git.exe".to_string())
+        );
+        // an unterminated quote is the shell's to complain about, not the allowlist's
+        assert_eq!(
+            program("\"C:\\tools\\x.exe"),
+            Ok("C:\\tools\\x.exe".to_string())
+        );
+        assert_eq!(program("dir C:\\"), Ok("dir".to_string()));
+        assert_eq!(
+            program("\"\""),
+            Err("Error: empty command after parsing".to_string())
+        );
+        assert_eq!(
+            program("   "),
+            Err("Error: empty command after parsing".to_string())
+        );
+        // and the pair the allowlist uses names the program, not the folder or the extension
+        for line in [
+            "C:\\Windows\\System32\\HOSTNAME.EXE",
+            "\"C:\\Windows\\System32\\hostname.exe\" /all",
+            "C:/Windows/System32/hostname.exe",
+        ] {
+            let base = base_command(&program(line).unwrap(), true);
+            assert_eq!(base, "hostname", "{line}");
+        }
     }
 
     #[test]

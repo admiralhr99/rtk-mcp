@@ -492,12 +492,8 @@ impl RtkMcpServer {
         // When RTK is available, `rtk rewrite` decides what it can filter;
         // unknown commands fall back to direct execution anyway.
         if !self.allow_all && !self.rtk_available {
-            let parts = shlex::split(&command)
-                .ok_or_else(|| "Failed to parse command: unmatched quotes".to_string())?;
-            if parts.is_empty() {
-                return Err("Error: empty command after parsing".to_string());
-            }
-            let base_cmd = shell::base_command(&parts[0], cfg!(windows));
+            let program = shell::program_of(&command, cfg!(windows))?;
+            let base_cmd = shell::base_command(&program, cfg!(windows));
             if !is_allowed_command(&base_cmd, cfg!(windows)) {
                 return Err(format!(
                     "Command '{}' is not in the allowlist. Set RTK_MCP_ALLOW_ALL=1 to bypass, \
