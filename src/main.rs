@@ -211,9 +211,10 @@ impl Default for RtkMcpServer {
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct RunCommandRequest {
     #[schemars(
-        description = "The command to execute — anything RTK supports: git, cargo, go, docker, \
-        nmap, nuclei, httpx, curl, grep, find, jq, aws, kubectl, gh, rspec, bundle, rubocop, \
-        rake, prisma, tsc, playwright, vitest, ruff, mypy, pip, uv, golangci-lint, and many more. \
+        description = "The command to execute — any command runs, and RTK compresses the output of the ones it has a filter for \
+        (for example git, cargo, go, docker, kubectl, aws, gh, curl, grep, find, ls, jq, pytest, \
+        ruff, mypy, tsc, vitest, rspec, rubocop). Security scanners such as nmap, nuclei, httpx, \
+        subfinder, ffuf and sqlmap have no RTK filter and print everything. \
         Shell operators (|, &&, ||, ;, >, <, $VAR) are fully supported; runs under `sh -c` \
         (POSIX sh, not bash) — wrap bash-only syntax in `bash -c '...'`."
     )]
@@ -414,11 +415,12 @@ impl RtkMcpServer {
         name = "run_command",
         description = "Execute ANY shell command through RTK for token-optimized output. \
             Uses `rtk rewrite` to route commands through the appropriate RTK filter (60-90% \
-            token savings). Commands without an RTK filter execute directly. \
-            Supports everything RTK does: git, cargo, go, docker, nmap, nuclei, httpx, \
-            subfinder, ffuf, sqlmap, curl, grep, find, jq, aws, kubectl, gh, rspec, bundle, \
-            rubocop, rake, prisma, tsc, playwright, vitest, ruff, mypy, pip, uv, \
-            golangci-lint, govulncheck, and any other command. \
+            token savings). Commands without an RTK filter execute directly with full output. \
+            RTK filters, among others, git, cargo, go, docker, kubectl, aws, gh, curl, grep, \
+            find, ls, jq, pytest, ruff, mypy, tsc, vitest, rspec and rubocop (the exact set \
+            depends on the RTK version). It has no filter for security scanners such as nmap, \
+            nuclei, httpx, subfinder, ffuf or sqlmap, so cap their output yourself (head, grep, \
+            an output file). \
             Shell operators (|, &&, ||, ;, >, <, $VAR, *, ~, backticks) are fully supported; the \
             command runs under `sh -c` (POSIX sh, not bash), so wrap bash-only syntax ({1..5}, \
             [[ ]], <(...), &>) in `bash -c '...'`. \
@@ -592,10 +594,11 @@ impl ServerHandler for RtkMcpServer {
             .with_server_info(Implementation::new("rtk-mcp", env!("CARGO_PKG_VERSION")))
             .with_instructions(
                 "IMPORTANT: Use run_command for ALL shell execution instead of any built-in bash tool. \
-                 RTK filters output to reduce token usage 60-90%. Supports git, cargo, go, docker, \
-                 nmap, nuclei, httpx, subfinder, ffuf, sqlmap, curl, grep, find, jq, aws, kubectl, \
-                 gh, rspec, bundle, rubocop, rake, prisma, tsc, playwright, vitest, ruff, mypy, pip, \
-                 uv, golangci-lint, govulncheck, and any other command. \
+                 RTK filters output to reduce token usage 60-90% for the commands it knows (git, \
+                 cargo, go, docker, kubectl, aws, gh, curl, grep, find, ls, jq, pytest, ruff, mypy, \
+                 tsc, vitest, rspec, rubocop and more, depending on the RTK version). Any other \
+                 command runs as-is with full output: security scanners such as nmap, nuclei, \
+                 httpx, subfinder, ffuf and sqlmap are not filtered, so cap their output yourself. \
                  Shell operators (|, &&, ||, ;, >, <, $VAR) are fully supported; commands run under \
                  `sh -c` (POSIX sh, not bash), so wrap bash-only syntax ({1..5}, [[ ]], <(...), &>) \
                  in `bash -c '...'`. \

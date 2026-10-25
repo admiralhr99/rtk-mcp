@@ -271,9 +271,10 @@ echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":
 ## Credits
 
 - [RTK (Rust Token Killer)](https://github.com/rtk-ai/rtk) by [rtk-ai](https://github.com/rtk-ai) — all filtering and rewrite logic
+- [rtk-mcp](https://github.com/ousamabenyounes/rtk-mcp) by [Ousama Ben Younes](https://github.com/ousamabenyounes) — the original MCP bridge this project started from (initial server, CI and the macOS installer)
 - [rmcp](https://github.com/modelcontextprotocol/rust-sdk) — Rust MCP SDK
 - Built with [Claude Code](https://claude.ai/code)
 
 ## License
 
-MIT
+MIT, see [LICENSE](LICENSE).

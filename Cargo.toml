@@ -5,7 +5,7 @@ edition = "2021"
 rust-version = "1.89"
 description = "MCP server bridge for RTK (Rust Token Killer) — exposes token-optimized CLI filtering to any MCP-compatible client"
 license = "MIT"
-repository = "https://github.com/ousamabenyounes/rtk-mcp"
+repository = "https://github.com/admiralhr99/rtk-mcp"
 keywords = ["mcp", "rtk", "token-optimization", "cli", "llm"]
 
 [dependencies]
