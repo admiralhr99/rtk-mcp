@@ -5,30 +5,51 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   build-and-test:
-    runs-on: ubuntu-latest
+    name: ${{ matrix.name }} / RTK ${{ matrix.rtk }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
+        runner: [ubuntu-latest, macos-latest, windows-latest]
         # Oldest RTK this server is tested against, and the current release. The protocol differs
         # between them (`rtk rewrite` exits 0 vs 3 for a rewrite, pipelines are rewritten
         # differently, `gain --recalls` only exists from 0.49).
         rtk: [v0.34.3, v0.49.0]
+        include:
+          - { runner: ubuntu-latest, name: Linux, python: python3, exe: "" }
+          - { runner: macos-latest, name: macOS, python: python3, exe: "" }
+          - { runner: windows-latest, name: Windows, python: python, exe: ".exe" }
     steps:
-      - uses: actions/checkout@v4
+      # Windows checks files out with CRLF by default; the sources are LF.
+      - name: Keep line endings as committed
+        if: runner.os == 'Windows'
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
+          toolchain: stable
           components: clippy, rustfmt
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -45,19 +66,18 @@ jobs:
       # Pinned, checksum-verified release binary: fast, and not a moving target like
       # `cargo install --git`. Installed before the tests so the RTK-backed unit tests run too.
       - name: Install RTK ${{ matrix.rtk }}
-        run: |
-          set -euo pipefail
-          ASSET=rtk-x86_64-unknown-linux-musl.tar.gz
-          BASE=https://github.com/rtk-ai/rtk/releases/download/${{ matrix.rtk }}
-          curl -fsSL "$BASE/$ASSET" -o "$RUNNER_TEMP/$ASSET"
-          curl -fsSL "$BASE/checksums.txt" -o "$RUNNER_TEMP/checksums.txt"
-          (cd "$RUNNER_TEMP" && grep "[[:space:]]$ASSET\$" checksums.txt | sha256sum -c -)
-          mkdir -p "$HOME/.local/bin"
-          tar xzf "$RUNNER_TEMP/$ASSET" -C "$HOME/.local/bin"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+        uses: ./.github/actions/install-rtk
+        with:
+          version: ${{ matrix.rtk }}
 
       - name: RTK version
         run: rtk --version
+
+      - name: Shells on this runner
+        if: runner.os == 'Windows'
+        run: |
+          where.exe bash
+          git --version
 
       - name: Unit tests
         run: cargo test --all
@@ -67,6 +87,7 @@ jobs:
 
       # Real MCP JSON-RPC over stdio against the release binary, in a throwaway HOME:
       # tool surface, RTK routing, deny rules, stats options, timeout/process-tree kill,
-      # UTF-8-safe truncation, and the no-RTK allowlist fallback.
+      # UTF-8-safe truncation, the no-RTK allowlist fallback, and on Windows the shell choice
+      # (Git Bash, cmd.exe) and an rtk.exe installed beside the server.
       - name: MCP functional test
-        run: python3 tests/functional.py target/release/rtk-mcp
+        run: ${{ matrix.python }} tests/functional.py target/release/rtk-mcp${{ matrix.exe }}
