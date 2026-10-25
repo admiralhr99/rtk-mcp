@@ -2,6 +2,24 @@
 
 MCP server bridge for [RTK (Rust Token Killer)](https://github.com/rtk-ai/rtk) — token-optimized CLI output for any MCP-compatible client.
 
+## Measured
+
+Same command, raw vs. through rtk-mcp. Sizes are what the model has to read. RTK 0.49.0, Linux.
+
+| Command | Raw | Through rtk-mcp | Reduction |
+|---------|----:|----------------:|----------:|
+| `cargo test` (this repo, 45 tests) | 2,749 B | 39 B | 98.6% |
+| `git diff 09e3d7d 4444d7b` (the 0.5.0 commit) | 140,137 B | 18,387 B | 86.9% |
+| `ls -la /usr/bin` | 131,046 B | 1,577 B | 98.8% |
+
+The whole `cargo test` result is one line: `cargo test: 45 passed (1 suite, 2.44s)`.
+
+The filtering is RTK's work; rtk-mcp is the bridge that lets MCP clients such as Claude Desktop use it. RTK summarizes, so it is lossy by design (`ls -la` drops owner and timestamps, `git diff` is condensed). When you need every line, prefix the command with `RTK_DISABLED=1` and you get the raw output.
+
+To reproduce, compare `<command> | wc -c` with `rtk <command> | wc -c`. Numbers vary with the repo, the machine and the RTK version.
+
+Platforms: Linux and macOS. Windows is not supported yet (the server needs a Unix shell). CI runs on Linux.
+
 ## What it does
 
 `rtk-mcp` exposes MCP tools that route shell commands through [RTK](https://github.com/rtk-ai/rtk) for **60-90% token reduction** before the output reaches your LLM's context window.
@@ -12,7 +30,7 @@ It uses `rtk rewrite` — RTK's canonical hook mechanism — to determine how ea
 MCP Client (Claude Desktop, Cursor, Windsurf, ...)
   → rtk-mcp (this server)
     → rtk rewrite "cargo test"  →  "rtk cargo test"
-    → sh -c "rtk cargo test"    ← filtered output (97% fewer tokens)
+    → sh -c "rtk cargo test"    ← filtered output (2,749 B → 39 B)
     → returns to LLM
 
     → rtk rewrite "nmap -sV …"  →  (no RTK filter)
@@ -41,7 +59,7 @@ MCP is a universal protocol. One server, every client:
 
 ## Real-world savings
 
-Measured over 25 days of daily usage with RTK:
+From the original rtk-mcp README: measured over 25 days of its author's daily use with RTK (not re-measured here; the table at the top is):
 
 | Filter | Token reduction |
 |--------|----------------|
@@ -94,7 +112,7 @@ The installer downloads RTK if it is missing (SHA-256 verified against the relea
 
 ### Claude Desktop
 
-Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS), `~/.config/Claude/claude_desktop_config.json` (Linux) or `%APPDATA%\Claude\claude_desktop_config.json` (Windows):
+Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or `~/.config/Claude/claude_desktop_config.json` (Linux):
 
 ```json
 {
@@ -231,7 +249,7 @@ When RTK is available, `rtk rewrite` is the gate. Its exit code decides: `1` mea
                                           │                      │
                                           │ "cargo test"         │
                                           │  → rtk cargo test    │
-                                          │  → 97% fewer tokens  │
+                                          │  → 39 B, not 2.7 KB  │
                                           └──────────────────────┘
 ```
 
