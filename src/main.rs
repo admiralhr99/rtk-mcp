@@ -987,24 +987,38 @@ async fn exec_with(
 }
 
 /// Kills a command's whole process tree when dropped, unless disarmed: SIGKILL to its process
-/// group on Unix, `taskkill /T` on Windows.
+/// group on Unix, a job object on Windows (`taskkill /T` if the process could not be put in one).
 #[cfg_attr(not(any(unix, windows)), allow(dead_code))]
-struct GroupKill(Option<u32>);
+struct GroupKill {
+    pid: Option<u32>,
+    #[cfg(windows)]
+    job: Option<shell::Job>,
+}
 
 impl GroupKill {
     fn new(pid: Option<u32>) -> Self {
-        Self(pid)
+        Self {
+            pid,
+            // Straight after the spawn: a shell needs far longer than this to start its own
+            // children, so they are born into the job.
+            #[cfg(windows)]
+            job: pid.and_then(shell::Job::holding),
+        }
     }
 
     fn disarm(&mut self) {
-        self.0 = None;
+        self.pid = None;
+        #[cfg(windows)]
+        {
+            self.job = None; // closing the handle leaves what is in the job running
+        }
     }
 }
 
 impl Drop for GroupKill {
     fn drop(&mut self) {
         #[cfg(unix)]
-        if let Some(pid) = self.0.filter(|&pid| pid > 1) {
+        if let Some(pid) = self.pid.filter(|&pid| pid > 1) {
             // SAFETY: a plain syscall. The child was spawned with process_group(0), so `pid` is
             // its group id and a negative pid addresses that whole group. `pid > 1` makes sure
             // we can never signal "every process" (-1) or our own group (0).
@@ -1013,8 +1027,11 @@ impl Drop for GroupKill {
             }
         }
         #[cfg(windows)]
-        if let Some(pid) = self.0 {
-            shell::kill_tree(pid);
+        if let Some(pid) = self.pid {
+            match &self.job {
+                Some(job) => job.kill(),
+                None => shell::kill_tree(pid),
+            }
         }
     }
 }
@@ -2292,6 +2309,31 @@ mod tests {
                 dies_soon(child).await,
                 "child {} survived the cancel",
                 child
+            );
+            let _ = std::fs::remove_file(&pidfile);
+        }
+
+        /// Git Bash starts a program by fork and exec, which leaves the new process without a
+        /// living parent: `taskkill /T` cannot find it, the job object the command runs in can.
+        #[tokio::test]
+        async fn timeout_kills_what_git_bash_started() {
+            let Some(shell) = Shell::posix() else { return };
+            let pidfile = pidfile("posix-timeout");
+            // the `sleep 1` first: /proc/$!/winpid names the forked shell until the exec is done
+            let line = format!(
+                "sleep 300 & sleep 1; cat /proc/$!/winpid > '{}'; wait",
+                pidfile.display().to_string().replace('\\', "/")
+            );
+            let err = exec_with(Command::from(shell.command(&line)), None, "test", limits(5))
+                .await
+                .err()
+                .expect("must time out");
+            assert!(err.contains("timed out after 5s"), "{}", err);
+            let sleeper = read_pid(&pidfile).await;
+            assert!(
+                dies_soon(sleeper).await,
+                "sleep {} survived the timeout",
+                sleeper
             );
             let _ = std::fs::remove_file(&pidfile);
         }

@@ -572,8 +572,9 @@ pub fn base_command(first: &str, windows: bool) -> String {
 
 /// Kill `pid` and everything it started (Windows has no process groups to signal).
 ///
-/// `taskkill /T` walks the tree by parent id, so it reaches the whole tree as long as the shell is
-/// alive, which it is when a timeout or a cancel calls this.
+/// `taskkill /T` walks the tree by parent id. That reaches everything cmd.exe and native programs
+/// start, but not what Git Bash starts: see [`Job`], which is what a command is run under. This is
+/// for a process that could not be put in a job, and for tests.
 #[cfg(windows)]
 pub fn kill_tree(pid: u32) {
     use std::os::windows::process::CommandExt;
@@ -594,6 +595,83 @@ pub fn kill_tree(pid: u32) {
         .stderr(Stdio::null())
         .creation_flags(CREATE_NO_WINDOW)
         .status();
+}
+
+/// A Windows job object holding the process tree of one command.
+///
+/// `taskkill /T` follows parent ids, and under Git Bash they lead nowhere: the Cygwin runtime
+/// starts a program by fork and exec, and the new process's parent id names the forked shell,
+/// which has exited by then. `sleep 300 &` is out of `taskkill`'s reach from the moment it runs
+/// (measured on a Windows runner). A job object holds every descendant of the process it was given
+/// whatever its parent id says, so [`Job::kill`] reaches them all.
+///
+/// Dropping the job only closes the handle: no kill-on-close limit is set, so what is in it runs
+/// on. That is what a command's deliberate background jobs need.
+#[cfg(windows)]
+pub struct Job(*mut std::ffi::c_void);
+
+// SAFETY: the handle names a kernel object and may be used from any thread.
+#[cfg(windows)]
+unsafe impl Send for Job {}
+#[cfg(windows)]
+unsafe impl Sync for Job {}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+extern "system" {
+    fn CreateJobObjectW(
+        attributes: *mut std::ffi::c_void,
+        name: *const u16,
+    ) -> *mut std::ffi::c_void;
+    fn AssignProcessToJobObject(job: *mut std::ffi::c_void, process: *mut std::ffi::c_void) -> i32;
+    fn TerminateJobObject(job: *mut std::ffi::c_void, exit_code: u32) -> i32;
+    fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut std::ffi::c_void;
+    fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
+}
+
+#[cfg(windows)]
+impl Job {
+    /// A job holding the process `pid` and, from now on, everything it starts. `None` if Windows
+    /// refuses: the process has already exited, or it sits in a job that cannot be nested.
+    pub fn holding(pid: u32) -> Option<Job> {
+        const PROCESS_TERMINATE: u32 = 0x0001;
+        const PROCESS_SET_QUOTA: u32 = 0x0100;
+        // SAFETY: plain handle calls; every handle opened here is closed on every path out.
+        unsafe {
+            let job = CreateJobObjectW(std::ptr::null_mut(), std::ptr::null());
+            if job.is_null() {
+                return None;
+            }
+            let process = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid);
+            let assigned = !process.is_null() && AssignProcessToJobObject(job, process) != 0;
+            if !process.is_null() {
+                CloseHandle(process);
+            }
+            if !assigned {
+                CloseHandle(job);
+                return None;
+            }
+            Some(Job(job))
+        }
+    }
+
+    /// Kill every process in the job.
+    pub fn kill(&self) {
+        // SAFETY: `self.0` is a job handle this value owns until it is dropped.
+        unsafe {
+            TerminateJobObject(self.0, 1);
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Job {
+    fn drop(&mut self) {
+        // SAFETY: the handle is owned by this value and closed only here.
+        unsafe {
+            CloseHandle(self.0);
+        }
+    }
 }
 
 #[cfg(test)]

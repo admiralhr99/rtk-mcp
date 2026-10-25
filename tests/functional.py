@@ -39,7 +39,9 @@ FAILURES = []
 
 # Things that differ between a POSIX shell on Linux/macOS and Git Bash on Windows.
 PWD = "pwd -W" if IS_WINDOWS else "pwd"  # Git Bash: `pwd -W` prints the Windows form of the directory
-BG_PID = "$(cat /proc/$!/winpid)" if IS_WINDOWS else "$!"  # the pid of the last background job, as the OS knows it
+# The pid of the last background job, as the OS knows it. Git Bash starts a program by fork and exec,
+# and /proc/$!/winpid names the forked shell until the exec has happened, so it waits a moment.
+BG_PID = "$(sleep 1; cat /proc/$!/winpid)" if IS_WINDOWS else "$!"
 # A path with no system dirs other than the basics, for the "RTK is missing" tests.
 BASIC_PATH = (
     os.pathsep.join(os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), d) for d in ("System32", ""))
@@ -105,6 +107,9 @@ class Server:
                 "APPDATA": os.path.join(self.home, "AppData", "Roaming"),
                 "LOCALAPPDATA": os.path.join(self.home, "AppData", "Local"),
             })
+            # RTK asks Windows for its data folder, and Windows only names a folder that exists
+            for sub in ("Roaming", "Local"):
+                os.makedirs(os.path.join(self.home, "AppData", sub), exist_ok=True)
         for key, value in (extra_env or {}).items():
             if IS_WINDOWS:  # variable names are case-insensitive there; os.environ upper-cases them
                 for existing in [k for k in self.env if k.upper() == key.upper()]:
@@ -348,9 +353,14 @@ def test_with_rtk(version):
         err, text = s.call("get_rtk_savings", view="reset")
         check("there is no way to reach --reset", err and "unknown variant" in text, text)
         err, text = s.call("get_rtk_discover", all=True, format="json")
-        check("discover all=true format=json works", not err and text.strip() != "", text)
-        err, text = s.call("get_rtk_discover", all=True, since=7, limit=3)
-        check("discover since/limit accepted", not err, text)
+        if IS_WINDOWS and err and "projects directory not found" in text:
+            # This RTK looks for Claude Code's history in the real profile folder on Windows, not
+            # in the HOME the test gave it, and a CI runner has none.
+            skip("discover all=true / since / limit", "no Claude Code history in this profile folder")
+        else:
+            check("discover all=true format=json works", not err and text.strip() != "", text)
+            err, text = s.call("get_rtk_discover", all=True, since=7, limit=3)
+            check("discover since/limit accepted", not err, text)
         err, text = s.call("get_rtk_discover", format="csv")
         check("discover rejects csv", err and "unknown variant" in text, text)
         err, text = s.call("get_rtk_session")
@@ -651,7 +661,8 @@ def test_windows(version, bash_path):
               not err and "héllo 日本語 العربية" in text, text)
         odd_names = ("日本語.txt", "héllo.txt", "العربية.txt")
         for name in odd_names:
-            open(os.path.join(s.project, name), "w").write(name)
+            with open(os.path.join(s.project, name), "w", encoding="utf-8") as f:
+                f.write(name)
         err, text = s.call("run_command", command="dir /b", cwd=s.project)
         check("cmd: dir shows file names outside the OEM code page",
               not err and all(name in text for name in odd_names), text)
