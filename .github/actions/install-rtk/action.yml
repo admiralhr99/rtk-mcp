@@ -1,0 +1,95 @@
+name: Install RTK
+description: >
+  Installs a pinned RTK release for the runner's system, checked against the release's
+  checksums.txt, and puts it on PATH for the steps that follow. Only the rtk executable is
+  installed, not the licence files that RTK 1.x puts in the same archive.
+
+inputs:
+  version:
+    description: RTK release tag, for example v1.1.0
+    required: true
+  edition:
+    description: >
+      full (the standard `rtk` build) or oss (the Apache-2.0 `rtk-oss` build, which RTK ships
+      from 1.0.0 on).
+    required: false
+    default: full
+
+runs:
+  using: composite
+  steps:
+    - name: Install RTK ${{ inputs.version }} (${{ inputs.edition }})
+      if: runner.os != 'Windows'
+      shell: bash
+      env:
+        RTK_VERSION: ${{ inputs.version }}
+        RTK_EDITION: ${{ inputs.edition }}
+      run: |
+        set -euo pipefail
+        case "$RTK_EDITION" in
+          full) PREFIX=rtk ;;
+          oss)  PREFIX=rtk-oss ;;
+          *) echo "unknown RTK edition '$RTK_EDITION' (full or oss)"; exit 1 ;;
+        esac
+        case "$RUNNER_OS-$RUNNER_ARCH" in
+          Linux-X64)   TARGET=x86_64-unknown-linux-musl ;;
+          Linux-ARM64) TARGET=aarch64-unknown-linux-gnu ;;
+          macOS-ARM64) TARGET=aarch64-apple-darwin ;;
+          macOS-X64)   TARGET=x86_64-apple-darwin ;;
+          *) echo "there is no RTK build for $RUNNER_OS $RUNNER_ARCH"; exit 1 ;;
+        esac
+        ASSET=$PREFIX-$TARGET.tar.gz
+        BASE=https://github.com/rtk-ai/rtk/releases/download/$RTK_VERSION
+        curl -fsSL "$BASE/$ASSET" -o "$RUNNER_TEMP/$ASSET"
+        curl -fsSL "$BASE/checksums.txt" -o "$RUNNER_TEMP/checksums.txt"
+        EXPECTED=$(grep "[[:space:]]$ASSET\$" "$RUNNER_TEMP/checksums.txt" | awk '{print $1}')
+        if command -v sha256sum >/dev/null; then
+          ACTUAL=$(sha256sum "$RUNNER_TEMP/$ASSET" | awk '{print $1}')
+        else
+          ACTUAL=$(shasum -a 256 "$RUNNER_TEMP/$ASSET" | awk '{print $1}')
+        fi
+        if [ -z "$EXPECTED" ] || [ "$EXPECTED" != "$ACTUAL" ]; then
+          echo "checksum mismatch for $ASSET: expected '$EXPECTED', got '$ACTUAL'"
+          exit 1
+        fi
+        mkdir -p "$HOME/.local/bin"
+        tar xzf "$RUNNER_TEMP/$ASSET" -C "$HOME/.local/bin" rtk
+        echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+    - name: Install RTK ${{ inputs.version }} (${{ inputs.edition }}, Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      env:
+        RTK_VERSION: ${{ inputs.version }}
+        RTK_EDITION: ${{ inputs.edition }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+        switch ($env:RTK_EDITION) {
+          'full' { $prefix = 'rtk' }
+          'oss'  { $prefix = 'rtk-oss' }
+          default { throw "unknown RTK edition '$($env:RTK_EDITION)' (full or oss)" }
+        }
+        $asset = "$prefix-x86_64-pc-windows-msvc.zip"
+        $base = "https://github.com/rtk-ai/rtk/releases/download/$env:RTK_VERSION"
+        $zip = Join-Path $env:RUNNER_TEMP $asset
+        $sums = Join-Path $env:RUNNER_TEMP 'checksums.txt'
+        Invoke-WebRequest -Uri "$base/$asset" -OutFile $zip
+        Invoke-WebRequest -Uri "$base/checksums.txt" -OutFile $sums
+        $expected = $null
+        foreach ($line in Get-Content $sums) {
+          if ($line -match ('^\s*([0-9a-fA-F]{64})\s+\*?' + [regex]::Escape($asset) + '\s*$')) {
+            $expected = $Matches[1].ToLowerInvariant()
+            break
+          }
+        }
+        if (-not $expected) { throw "checksums.txt has no entry for $asset" }
+        $actual = (Get-FileHash -Algorithm SHA256 -Path $zip).Hash.ToLowerInvariant()
+        if ($actual -ne $expected) { throw "checksum mismatch for ${asset}: expected $expected, got $actual" }
+        $stage = Join-Path $env:RUNNER_TEMP ('rtk-' + [guid]::NewGuid().ToString('N'))
+        Expand-Archive -Path $zip -DestinationPath $stage -Force
+        $exe = Get-ChildItem -Path $stage -Recurse -Filter rtk.exe -File | Select-Object -First 1
+        if (-not $exe) { throw "$asset holds no rtk.exe" }
+        $bin = Join-Path $env:USERPROFILE '.local\bin'
+        New-Item -ItemType Directory -Force -Path $bin | Out-Null
+        Copy-Item -LiteralPath $exe.FullName -Destination (Join-Path $bin 'rtk.exe') -Force
+        Add-Content -Path $env:GITHUB_PATH -Value $bin

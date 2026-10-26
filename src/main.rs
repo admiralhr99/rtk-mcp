@@ -1,3 +1,5 @@
+mod shell;
+
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -16,6 +18,7 @@ use rmcp::{
     transport::stdio,
     RoleServer, ServerHandler, ServiceExt,
 };
+use shell::Shell;
 use tracing_subscriber::EnvFilter;
 
 /// Maximum command string length (prevents memory abuse).
@@ -145,6 +148,25 @@ const ALLOWED_COMMANDS: &[&str] = &[
     "tar", "unzip", "zip",
 ];
 
+/// Also allowed on Windows (and only there): the shells and built-ins a Windows session reaches for.
+const WINDOWS_COMMANDS: &[&str] = &[
+    "cmd",
+    "powershell",
+    "pwsh",
+    "dir",
+    "findstr",
+    "where",
+    "ipconfig",
+    "tasklist",
+    "hostname",
+    "systeminfo",
+];
+
+/// Is `base` (a command name from [`shell::base_command`]) allowed while RTK is absent?
+fn is_allowed_command(base: &str, windows: bool) -> bool {
+    ALLOWED_COMMANDS.contains(&base) || (windows && WINDOWS_COMMANDS.contains(&base))
+}
+
 #[derive(Debug, Clone)]
 pub struct RtkMcpServer {
     tool_router: ToolRouter<Self>,
@@ -172,9 +194,13 @@ impl RtkMcpServer {
         if allow_all && !rtk_available {
             tracing::warn!("RTK_MCP_ALLOW_ALL=1 — allowlist bypassed, all commands permitted");
         }
+        // The shell is chosen, and logged, once at startup (on Windows this is where Git Bash is
+        // looked for); the tool descriptions then say which one it is.
+        let mut tool_router = Self::tool_router();
+        describe_shell(&mut tool_router, Shell::current());
 
         Self {
-            tool_router: Self::tool_router(),
+            tool_router,
             rtk_available,
             rtk_version,
             allow_all,
@@ -466,13 +492,9 @@ impl RtkMcpServer {
         // When RTK is available, `rtk rewrite` decides what it can filter;
         // unknown commands fall back to direct execution anyway.
         if !self.allow_all && !self.rtk_available {
-            let parts = shlex::split(&command)
-                .ok_or_else(|| "Failed to parse command: unmatched quotes".to_string())?;
-            if parts.is_empty() {
-                return Err("Error: empty command after parsing".to_string());
-            }
-            let base_cmd = parts[0].rsplit('/').next().unwrap_or(&parts[0]).to_string();
-            if !ALLOWED_COMMANDS.contains(&base_cmd.as_str()) {
+            let program = shell::program_of(&command, cfg!(windows))?;
+            let base_cmd = shell::base_command(&program, cfg!(windows));
+            if !is_allowed_command(&base_cmd, cfg!(windows)) {
                 return Err(format!(
                     "Command '{}' is not in the allowlist. Set RTK_MCP_ALLOW_ALL=1 to bypass, \
                     or use one of: {}",
@@ -542,7 +564,10 @@ impl RtkMcpServer {
         Parameters(request): Parameters<GetRtkSavingsRequest>,
     ) -> Result<String, String> {
         if !self.rtk_available {
-            return Ok("RTK not installed — no savings data available.\nInstall: cargo install --git https://github.com/rtk-ai/rtk".to_string());
+            return Ok(format!(
+                "RTK not installed — no savings data available.\nInstall: {}",
+                install_hint()
+            ));
         }
         let cwd = request.cwd.as_deref().map(validate_cwd).transpose()?;
         self.run_rtk(&gain_args(&request), cwd.as_deref()).await
@@ -565,7 +590,10 @@ impl RtkMcpServer {
         Parameters(request): Parameters<GetRtkDiscoverRequest>,
     ) -> Result<String, String> {
         if !self.rtk_available {
-            return Ok("RTK not installed — discovery unavailable.\nInstall: cargo install --git https://github.com/rtk-ai/rtk".to_string());
+            return Ok(format!(
+                "RTK not installed — discovery unavailable.\nInstall: {}",
+                install_hint()
+            ));
         }
         self.run_rtk(&discover_args(&request), None).await
     }
@@ -581,7 +609,10 @@ impl RtkMcpServer {
     )]
     async fn get_rtk_session(&self) -> Result<String, String> {
         if !self.rtk_available {
-            return Ok("RTK not installed — session data unavailable.\nInstall: cargo install --git https://github.com/rtk-ai/rtk".to_string());
+            return Ok(format!(
+                "RTK not installed — session data unavailable.\nInstall: {}",
+                install_hint()
+            ));
         }
         self.run_rtk(&["session".to_string()], None).await
     }
@@ -592,25 +623,89 @@ impl ServerHandler for RtkMcpServer {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("rtk-mcp", env!("CARGO_PKG_VERSION")))
-            .with_instructions(
-                "IMPORTANT: Use run_command for ALL shell execution instead of any built-in bash tool. \
-                 RTK filters output to reduce token usage 60-90% for the commands it knows (git, \
-                 cargo, go, docker, kubectl, aws, gh, curl, grep, find, ls, jq, pytest, ruff, mypy, \
-                 tsc, vitest, rspec, rubocop and more, depending on the RTK version). Any other \
-                 command runs as-is with full output: security scanners such as nmap, nuclei, \
-                 httpx, subfinder, ffuf and sqlmap are not filtered, so cap their output yourself. \
-                 Shell operators (|, &&, ||, ;, >, <, $VAR) are fully supported; commands run under \
-                 `sh -c` (POSIX sh, not bash), so wrap bash-only syntax ({1..5}, [[ ]], <(...), &>) \
-                 in `bash -c '...'`. \
-                 Always pass 'cwd' so commands run in the right directory. Timeout is configurable \
-                 via RTK_MCP_TIMEOUT_SECS (default 300s), the output cap via RTK_MCP_MAX_OUTPUT_KB \
-                 (default 256KB). A background job (`cmd &`, `ssh -f`) must send its output to a \
-                 file (`> log 2>&1 &`) or it is cut loose from the call after a few seconds. \
-                 If RTK elides part of an output it prints a recall hint (`rtk recall <id>` or a \
-                 saved-file path) — run it with run_command to get the full text. \
-                 Prefix a command with RTK_DISABLED=1 to bypass filtering and get raw output.",
-            )
+            .with_instructions(instructions(Shell::current()))
     }
+}
+
+/// The sentence about the shell in the `command` parameter's description (see
+/// [`RunCommandRequest`]), kept here so it can be swapped out when the shell is not `sh`.
+const PARAM_SHELL_CLAUSE: &str =
+    "runs under `sh -c` (POSIX sh, not bash) — wrap bash-only syntax in `bash -c '...'`.";
+
+/// The same sentence in the description of the `run_command` tool.
+const TOOL_SHELL_CLAUSE: &str = "the command runs under `sh -c` (POSIX sh, not bash), so wrap \
+     bash-only syntax ({1..5}, [[ ]], <(...), &>) in `bash -c '...'`.";
+
+/// The descriptions in the source describe `sh -c`: right on Linux and macOS, where they are left
+/// exactly as written. On Windows the shell is Git Bash or cmd.exe, so `run_command` says so.
+fn describe_shell(router: &mut ToolRouter<RtkMcpServer>, shell: &Shell) {
+    let Some(clause) = shell.runs_under() else {
+        return;
+    };
+    let Some(route) = router.map.get_mut("run_command") else {
+        return;
+    };
+    let tool = &mut route.attr;
+    if let Some(text) = tool.description.take() {
+        let adapted = text.replace(TOOL_SHELL_CLAUSE, &format!("the command {clause}"));
+        tool.description = Some(adapted.into());
+    }
+    let mut schema = (*tool.input_schema).clone();
+    if let Some(serde_json::Value::String(text)) = schema
+        .get_mut("properties")
+        .and_then(|properties| properties.get_mut("command"))
+        .and_then(|command| command.get_mut("description"))
+    {
+        *text = text.replace(PARAM_SHELL_CLAUSE, &clause);
+    }
+    tool.input_schema = Arc::new(schema);
+}
+
+/// How to install RTK, for the stats tools when it is missing.
+fn install_hint() -> &'static str {
+    if cfg!(windows) {
+        "winget install rtk-ai.rtk"
+    } else {
+        "cargo install --git https://github.com/rtk-ai/rtk"
+    }
+}
+
+/// Windows: keep a console window from flashing up for a probe.
+fn hide_console(command: &mut std::process::Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(shell::CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    let _ = command;
+}
+
+/// The server instructions up to the sentence about shell syntax.
+const INSTRUCTIONS_HEAD: &str =
+    "IMPORTANT: Use run_command for ALL shell execution instead of any built-in bash tool. \
+     RTK filters output to reduce token usage 60-90% for the commands it knows (git, \
+     cargo, go, docker, kubectl, aws, gh, curl, grep, find, ls, jq, pytest, ruff, mypy, \
+     tsc, vitest, rspec, rubocop and more, depending on the RTK version). Any other \
+     command runs as-is with full output: security scanners such as nmap, nuclei, \
+     httpx, subfinder, ffuf and sqlmap are not filtered, so cap their output yourself. ";
+
+/// The server instructions after the sentence about shell syntax.
+const INSTRUCTIONS_TAIL: &str =
+    "Always pass 'cwd' so commands run in the right directory. Timeout is configurable \
+     via RTK_MCP_TIMEOUT_SECS (default 300s), the output cap via RTK_MCP_MAX_OUTPUT_KB \
+     (default 256KB). A background job (`cmd &`, `ssh -f`) must send its output to a \
+     file (`> log 2>&1 &`) or it is cut loose from the call after a few seconds. \
+     If RTK elides part of an output it prints a recall hint (`rtk recall <id>` or a \
+     saved-file path) — run it with run_command to get the full text. \
+     Prefix a command with RTK_DISABLED=1 to bypass filtering and get raw output.";
+
+/// What the server tells the model when it connects; `shell` supplies the sentence about syntax.
+fn instructions(shell: &Shell) -> String {
+    format!(
+        "{INSTRUCTIONS_HEAD}{} {INSTRUCTIONS_TAIL}",
+        shell.syntax_note()
+    )
 }
 
 struct CommandResult {
@@ -633,7 +728,7 @@ fn validate_cwd(cwd: &str) -> Result<PathBuf, String> {
             return Err(format!("cwd '{}' is outside allowed root '{}'", cwd, jail));
         }
     }
-    Ok(abs)
+    Ok(shell::plain_path(abs))
 }
 
 /// What `rtk rewrite` decided about a command.
@@ -701,6 +796,8 @@ async fn rewrite_via(program: &str, command: &str, cwd: Option<&Path>) -> Rewrit
     cmd.args(["rewrite", "--", command]);
     cmd.stdin(Stdio::null()); // isolate from MCP transport fd
     cmd.kill_on_drop(true);
+    #[cfg(windows)]
+    cmd.creation_flags(shell::CREATE_NO_WINDOW);
     child_env(&mut cmd);
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
@@ -725,15 +822,54 @@ fn child_env(command: &mut Command) {
     if std::env::var_os("RTK_SUPPRESS_HOOK_WARNING").is_none() {
         command.env("RTK_SUPPRESS_HOOK_WARNING", "1");
     }
+    // Windows: Python encodes what it writes to a pipe in the ANSI code page, and fails with a
+    // UnicodeEncodeError on the first character outside it. The output is read as UTF-8.
+    #[cfg(windows)]
+    if std::env::var_os("PYTHONIOENCODING").is_none()
+        && !command.as_std().get_envs().any(|(key, _)| {
+            key.to_str()
+                .is_some_and(|k| k.eq_ignore_ascii_case("PYTHONIOENCODING"))
+        })
+    {
+        command.env("PYTHONIOENCODING", "utf-8");
+    }
+    // Windows: an rtk.exe installed next to rtk-mcp.exe has to be found by the shell as well. The
+    // PATH to extend is the one the command already carries (a POSIX shell's tools directory is put
+    // there by `Shell::command`), else this process's own.
+    if let Some(dir) = shell::bundled_rtk_dir() {
+        let current = command
+            .as_std()
+            .get_envs()
+            .find(|(key, _)| key.to_str().is_some_and(|k| k.eq_ignore_ascii_case("PATH")))
+            .and_then(|(_, value)| value.map(std::ffi::OsStr::to_os_string))
+            .or_else(|| std::env::var_os("PATH"));
+        command.env(
+            "PATH",
+            shell::path_with_dirs_first(current.as_deref(), &[dir]),
+        );
+    }
 }
 
-/// Execute a command string via `sh -c` (supports shell operators and env var expansion).
+/// Execute a command string in the platform's shell: `sh -c` on Linux and macOS (supports shell
+/// operators and env var expansion), Git Bash or cmd.exe on Windows (see [`Shell`]).
 ///
 /// See [`exec`] for stdin isolation, process-group handling and the timeout.
 async fn run_shell_cmd(shell_str: &str, cwd: Option<&Path>) -> Result<CommandResult, String> {
-    let mut command = Command::new("sh");
-    command.args(["-c", shell_str]);
-    exec(command, cwd, "shell command").await
+    run_in_shell(Shell::current(), shell_str, cwd).await
+}
+
+/// [`run_shell_cmd`] with an explicit shell (lets the tests pick one).
+async fn run_in_shell(
+    shell: &Shell,
+    shell_str: &str,
+    cwd: Option<&Path>,
+) -> Result<CommandResult, String> {
+    exec(
+        Command::from(shell.command(shell_str)),
+        cwd,
+        "shell command",
+    )
+    .await
 }
 
 /// Execute a command directly (no shell expansion). Used for RTK probes and savings tools.
@@ -792,6 +928,8 @@ async fn exec_with(
     command.kill_on_drop(true); // ← backstop: kill the direct child if this future is dropped
     #[cfg(unix)]
     command.process_group(0); // ← child leads its own group so the whole tree can be killed
+    #[cfg(windows)]
+    command.creation_flags(shell::CREATE_NO_WINDOW); // ← no console window per command
     child_env(&mut command);
     if let Some(dir) = cwd {
         command.current_dir(dir);
@@ -848,29 +986,51 @@ async fn exec_with(
     Ok(result)
 }
 
-/// SIGKILLs a command's whole process group when dropped, unless disarmed.
-#[cfg_attr(not(unix), allow(dead_code))]
-struct GroupKill(Option<u32>);
+/// Kills a command's whole process tree when dropped, unless disarmed: SIGKILL to its process
+/// group on Unix, a job object on Windows (`taskkill /T` if the process could not be put in one).
+#[cfg_attr(not(any(unix, windows)), allow(dead_code))]
+struct GroupKill {
+    pid: Option<u32>,
+    #[cfg(windows)]
+    job: Option<shell::Job>,
+}
 
 impl GroupKill {
     fn new(pid: Option<u32>) -> Self {
-        Self(pid)
+        Self {
+            pid,
+            // Straight after the spawn: a shell needs far longer than this to start its own
+            // children, so they are born into the job.
+            #[cfg(windows)]
+            job: pid.and_then(shell::Job::holding),
+        }
     }
 
     fn disarm(&mut self) {
-        self.0 = None;
+        self.pid = None;
+        #[cfg(windows)]
+        {
+            self.job = None; // closing the handle leaves what is in the job running
+        }
     }
 }
 
 impl Drop for GroupKill {
     fn drop(&mut self) {
         #[cfg(unix)]
-        if let Some(pid) = self.0.filter(|&pid| pid > 1) {
+        if let Some(pid) = self.pid.filter(|&pid| pid > 1) {
             // SAFETY: a plain syscall. The child was spawned with process_group(0), so `pid` is
             // its group id and a negative pid addresses that whole group. `pid > 1` makes sure
             // we can never signal "every process" (-1) or our own group (0).
             unsafe {
                 libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+            }
+        }
+        #[cfg(windows)]
+        if let Some(pid) = self.pid {
+            match &self.job {
+                Some(job) => job.kill(),
+                None => shell::kill_tree(pid),
             }
         }
     }
@@ -1007,11 +1167,10 @@ fn collect_output(stdout: &[u8], stderr: &[u8]) -> String {
 /// Stdin is explicitly set to null so these probes never touch the MCP transport fd.
 /// Returns the `rtk --version` line (e.g. "rtk 0.49.0") when RTK is usable.
 fn detect_rtk() -> Option<String> {
-    let version_out = std::process::Command::new("rtk")
-        .arg("--version")
-        .stdin(Stdio::null())
-        .output()
-        .ok()?;
+    let mut version_probe = std::process::Command::new("rtk");
+    version_probe.arg("--version").stdin(Stdio::null());
+    hide_console(&mut version_probe);
+    let version_out = version_probe.output().ok()?;
     let version = String::from_utf8_lossy(&version_out.stdout)
         .trim()
         .to_string();
@@ -1027,6 +1186,7 @@ fn detect_rtk() -> Option<String> {
     if std::env::var_os("RTK_SUPPRESS_HOOK_WARNING").is_none() {
         probe.env("RTK_SUPPRESS_HOOK_WARNING", "1");
     }
+    hide_console(&mut probe);
     let output = probe.output().ok()?;
     match interpret_rewrite(
         output.status.code(),
@@ -1038,8 +1198,39 @@ fn detect_rtk() -> Option<String> {
     }
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    // Windows: this executable is also the launcher of cmd.exe commands (`shell::run_cmd_launcher`),
+    // which has to run before anything of the server starts.
+    #[cfg(windows)]
+    {
+        let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+        if args
+            .get(1)
+            .is_some_and(|arg| arg == shell::CMD_LAUNCHER_ARG)
+        {
+            let code = match (args.get(2), args.get(3)) {
+                (Some(cmd), Some(line)) => shell::run_cmd_launcher(cmd, line),
+                _ => {
+                    eprintln!(
+                        "usage: rtk-mcp {} <cmd.exe> <command line>",
+                        shell::CMD_LAUNCHER_ARG
+                    );
+                    2
+                }
+            };
+            std::process::exit(code);
+        }
+        if let Ok(exe) = std::env::current_exe() {
+            shell::use_cmd_launcher(exe);
+        }
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(serve())
+}
+
+async fn serve() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()))
         .with_writer(std::io::stderr)
@@ -1167,16 +1358,35 @@ mod tests {
         assert_eq!(collect_output(b"out", b"err"), "out\n[stderr]\nerr");
     }
 
+    /// A command that runs `line` in a POSIX shell: `sh`, or Git Bash on Windows. `None` on a
+    /// Windows machine without Git, where the tests that need one have nothing to run.
+    fn posix(line: &str) -> Option<Command> {
+        Shell::posix().map(|shell| Command::from(shell.command(line)))
+    }
+
     #[tokio::test]
     async fn run_with_timeout_basic() {
-        let result = run_with_timeout("echo", &["hello"], None).await.unwrap();
+        // a real program on every platform (`echo` is a cmd.exe built-in on Windows)
+        let result = run_with_timeout("cargo", &["--version"], None)
+            .await
+            .unwrap();
         assert!(result.success);
-        assert!(result.output.contains("hello"));
+        assert!(result.output.contains("cargo"));
+    }
+
+    /// `echo` means the same in sh, Git Bash and cmd.exe, so this runs in whichever shell the
+    /// platform uses.
+    #[tokio::test]
+    async fn run_shell_cmd_runs_in_the_platform_shell() {
+        let result = run_shell_cmd("echo hello", None).await.unwrap();
+        assert!(result.success);
+        assert_eq!(result.output.trim(), "hello");
     }
 
     #[tokio::test]
     async fn run_shell_cmd_pipe() {
-        let result = run_shell_cmd("echo hello | tr a-z A-Z", None)
+        let Some(shell) = Shell::posix() else { return };
+        let result = run_in_shell(&shell, "echo hello | tr a-z A-Z", None)
             .await
             .unwrap();
         assert!(result.success);
@@ -1185,7 +1395,8 @@ mod tests {
 
     #[tokio::test]
     async fn run_shell_cmd_env_var() {
-        let result = run_shell_cmd("echo $HOME", None).await.unwrap();
+        let Some(shell) = Shell::posix() else { return };
+        let result = run_in_shell(&shell, "echo $HOME", None).await.unwrap();
         assert!(result.success);
         assert!(!result.output.trim().is_empty());
         assert_ne!(result.output.trim(), "$HOME");
@@ -1234,12 +1445,13 @@ mod tests {
         }
     }
 
-    /// A fresh, canonical scratch directory (the temp dir itself may be a symlink, e.g. on macOS).
+    /// A fresh, canonical scratch directory (the temp dir itself may be a symlink, e.g. on macOS,
+    /// or an 8.3 short name on Windows), in the plain form `validate_cwd` returns.
     fn scratch_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("rtk-mcp-{}-{}", name, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        dir.canonicalize().unwrap()
+        shell::plain_path(dir.canonicalize().unwrap())
     }
 
     /// Run `f` with RTK_MCP_CWD_JAIL set to `jail` (or unset), then put the variable back.
@@ -1444,8 +1656,20 @@ mod tests {
         path.to_string_lossy().into_owned()
     }
 
+    /// The same as a batch file, which Windows runs through cmd.exe.
+    #[cfg(windows)]
+    fn stub_rtk(dir: &std::path::Path, code: i32, stdout: &str) -> String {
+        let path = dir.join(format!("rtk-stub-{}.cmd", code));
+        let print = if stdout.is_empty() {
+            String::new()
+        } else {
+            format!("echo {}\r\n", stdout)
+        };
+        std::fs::write(&path, format!("@echo off\r\n{}exit /b {}\r\n", print, code)).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
     /// End to end through a real process: the exit code, not just stdout, decides.
-    #[cfg(unix)]
     #[tokio::test]
     async fn rewrite_via_honours_exit_codes() {
         let dir = std::env::temp_dir().join(format!("rtk-mcp-stub-{}", std::process::id()));
@@ -1497,8 +1721,9 @@ mod tests {
     #[tokio::test]
     async fn multibyte_output_over_limit_is_truncated_not_fatal() {
         // 3-byte characters, so a cut at 64 * 1024 (not divisible by 3) lands mid-character.
-        let mut command = Command::new("sh");
-        command.args(["-c", "yes 日本語日本語 | head -c 200000"]);
+        let Some(command) = posix("yes 日本語日本語 | head -c 200000") else {
+            return;
+        };
         let limits = Limits {
             max_output: 64 * 1024,
             ..limits(60)
@@ -1515,8 +1740,9 @@ mod tests {
     /// A runaway command must neither exhaust memory nor wedge the server.
     #[tokio::test]
     async fn runaway_output_is_capped() {
-        let mut command = Command::new("sh");
-        command.args(["-c", "head -c 50000000 /dev/zero | tr '\\0' x"]);
+        let Some(command) = posix("head -c 50000000 /dev/zero | tr '\\0' x") else {
+            return;
+        };
         let result = exec_with(command, None, "test", limits(60)).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("[output truncated at 256KB"));
@@ -1527,8 +1753,9 @@ mod tests {
     #[tokio::test]
     async fn output_cap_follows_the_limit() {
         for kb in [1usize, 8, 100] {
-            let mut command = Command::new("sh");
-            command.args(["-c", "head -c 500000 /dev/zero | tr '\\0' x"]);
+            let Some(command) = posix("head -c 500000 /dev/zero | tr '\\0' x") else {
+                return;
+            };
             let limits = Limits {
                 max_output: kb * 1024,
                 ..limits(60)
@@ -1550,8 +1777,9 @@ mod tests {
     /// Output that fits under the cap comes back whole — nothing is cut or annotated.
     #[tokio::test]
     async fn output_under_the_cap_is_returned_whole() {
-        let mut command = Command::new("sh");
-        command.args(["-c", "head -c 200000 /dev/zero | tr '\\0' y"]);
+        let Some(command) = posix("head -c 200000 /dev/zero | tr '\\0' y") else {
+            return;
+        };
         let result = exec_with(command, None, "test", limits(60)).await.unwrap();
         assert_eq!(result.output, "y".repeat(200_000));
     }
@@ -1559,8 +1787,9 @@ mod tests {
     /// Both streams survive, and the exit code of a failing command is reported as before.
     #[tokio::test]
     async fn failing_command_keeps_both_streams_and_its_exit_code() {
-        let mut command = Command::new("sh");
-        command.args(["-c", "echo to-stdout; echo to-stderr >&2; exit 3"]);
+        let Some(command) = posix("echo to-stdout; echo to-stderr >&2; exit 3") else {
+            return;
+        };
         let result = exec_with(command, None, "test", limits(60)).await.unwrap();
         assert!(!result.success);
         assert_eq!(result.exit_code, 3);
@@ -1629,7 +1858,8 @@ mod tests {
     /// Regression test: child processes must not inherit the MCP server's stdin.
     #[tokio::test]
     async fn stdin_is_isolated_from_parent() {
-        let result = run_shell_cmd("cat", None).await.unwrap();
+        let Some(shell) = Shell::posix() else { return };
+        let result = run_in_shell(&shell, "cat", None).await.unwrap();
         assert!(result.success, "cat read from /dev/null should succeed");
         assert!(result.output == "(no output)" || result.output.is_empty());
     }
@@ -1819,27 +2049,36 @@ mod tests {
     }
 
     /// A timed-out scan still hands back what it had printed before the cutoff.
-    #[cfg(unix)]
     #[tokio::test]
     async fn timeout_returns_the_output_printed_so_far() {
-        let mut command = Command::new("sh");
-        command.args(["-c", "echo found-port-80; echo noisy-warning >&2; sleep 60"]);
-        let err = exec_with(command, None, "test", limits(1))
+        let Some(command) = posix("echo found-port-80; echo noisy-warning >&2; sleep 60") else {
+            return;
+        };
+        let err = exec_with(command, None, "test", limits(2))
             .await
             .err()
             .expect("must time out");
-        assert!(err.starts_with("command timed out after 1s"), "{}", err);
+        assert!(err.starts_with("command timed out after 2s"), "{}", err);
         assert!(err.contains("found-port-80"), "{}", err);
         assert!(err.contains("noisy-warning"), "{}", err);
 
         // a command that never printed anything gets the bare timeout message
-        let mut silent = Command::new("sh");
-        silent.args(["-c", "sleep 60"]);
-        let err = exec_with(silent, None, "test", limits(1))
+        let Some(silent) = posix("sleep 60") else {
+            return;
+        };
+        let err = exec_with(silent, None, "test", limits(2))
             .await
             .err()
             .expect("must time out");
-        assert_eq!(err, "command timed out after 1s");
+        assert_eq!(err, "command timed out after 2s");
+    }
+
+    /// A command line that prints `[<value of RTK_SUPPRESS_HOOK_WARNING>]` in the platform's shell.
+    fn echo_hook_var() -> &'static str {
+        match Shell::current() {
+            Shell::Cmd(_) => "echo [%RTK_SUPPRESS_HOOK_WARNING%]",
+            _ => "echo \"[$RTK_SUPPRESS_HOOK_WARNING]\"",
+        }
     }
 
     /// The daily "no hook installed" nag must not reach the LLM-visible output.
@@ -1854,11 +2093,11 @@ mod tests {
             .build()
             .unwrap();
         let default = runtime
-            .block_on(run_shell_cmd("echo \"[$RTK_SUPPRESS_HOOK_WARNING]\"", None))
+            .block_on(run_shell_cmd(echo_hook_var(), None))
             .unwrap();
         std::env::set_var("RTK_SUPPRESS_HOOK_WARNING", "0");
         let explicit = runtime
-            .block_on(run_shell_cmd("echo \"[$RTK_SUPPRESS_HOOK_WARNING]\"", None))
+            .block_on(run_shell_cmd(echo_hook_var(), None))
             .unwrap();
 
         match saved {
@@ -1871,5 +2110,387 @@ mod tests {
             "[0]",
             "an explicit user setting must win"
         );
+    }
+
+    /// What the server told the model about itself before the Windows port. Linux and macOS
+    /// still send exactly this.
+    const INSTRUCTIONS_0_5_1: &str = r#"IMPORTANT: Use run_command for ALL shell execution instead of any built-in bash tool. RTK filters output to reduce token usage 60-90% for the commands it knows (git, cargo, go, docker, kubectl, aws, gh, curl, grep, find, ls, jq, pytest, ruff, mypy, tsc, vitest, rspec, rubocop and more, depending on the RTK version). Any other command runs as-is with full output: security scanners such as nmap, nuclei, httpx, subfinder, ffuf and sqlmap are not filtered, so cap their output yourself. Shell operators (|, &&, ||, ;, >, <, $VAR) are fully supported; commands run under `sh -c` (POSIX sh, not bash), so wrap bash-only syntax ({1..5}, [[ ]], <(...), &>) in `bash -c '...'`. Always pass 'cwd' so commands run in the right directory. Timeout is configurable via RTK_MCP_TIMEOUT_SECS (default 300s), the output cap via RTK_MCP_MAX_OUTPUT_KB (default 256KB). A background job (`cmd &`, `ssh -f`) must send its output to a file (`> log 2>&1 &`) or it is cut loose from the call after a few seconds. If RTK elides part of an output it prints a recall hint (`rtk recall <id>` or a saved-file path) — run it with run_command to get the full text. Prefix a command with RTK_DISABLED=1 to bypass filtering and get raw output."#;
+
+    #[test]
+    fn sh_instructions_are_what_0_5_1_sent() {
+        assert_eq!(instructions(&Shell::Sh), INSTRUCTIONS_0_5_1);
+    }
+
+    #[test]
+    fn instructions_name_the_windows_shells() {
+        let bash = instructions(&Shell::Posix(PathBuf::from("bash.exe")));
+        let cmd = instructions(&Shell::Cmd(PathBuf::from("cmd.exe")));
+        for text in [&bash, &cmd] {
+            assert!(text.starts_with(INSTRUCTIONS_HEAD), "{text}");
+            assert!(text.ends_with(INSTRUCTIONS_TAIL), "{text}");
+            assert!(!text.contains("`sh -c`"), "{text}");
+        }
+        assert!(bash.contains("POSIX shell on Windows"), "{bash}");
+        assert!(cmd.contains("cmd.exe"), "{cmd}");
+    }
+
+    /// The descriptions say `sh -c` on Linux and macOS and are left alone there; on Windows
+    /// `run_command` names the shell the server really uses.
+    #[test]
+    fn run_command_descriptions_follow_the_shell() {
+        let describe = |shell: &Shell| {
+            let mut router = RtkMcpServer::tool_router();
+            describe_shell(&mut router, shell);
+            let tool = router
+                .get("run_command")
+                .expect("run_command is registered");
+            let param = tool.input_schema["properties"]["command"]["description"]
+                .as_str()
+                .expect("the command parameter is described")
+                .to_string();
+            (
+                tool.description.as_deref().unwrap_or_default().to_string(),
+                param,
+            )
+        };
+        let (tool, param) = describe(&Shell::Sh);
+        assert!(tool.contains(TOOL_SHELL_CLAUSE), "{tool}");
+        assert!(param.contains(PARAM_SHELL_CLAUSE), "{param}");
+
+        let bash = Shell::Posix(PathBuf::from("bash.exe"));
+        let cmd = Shell::Cmd(PathBuf::from("cmd.exe"));
+        for shell in [&bash, &cmd] {
+            let (tool, param) = describe(shell);
+            for text in [&tool, &param] {
+                assert!(!text.contains("`sh -c`"), "{shell:?}: {text}");
+                assert!(
+                    text.contains("on this Windows machine"),
+                    "{shell:?}: {text}"
+                );
+            }
+            // the rest of each description is as it was
+            assert!(tool.contains("Falls back to raw execution"), "{tool}");
+            assert!(param.contains("Security scanners such as"), "{param}");
+        }
+    }
+
+    #[test]
+    fn windows_commands_are_allowed_only_on_windows() {
+        for cmd in WINDOWS_COMMANDS {
+            assert!(is_allowed_command(cmd, true), "{cmd}");
+            assert!(
+                !is_allowed_command(cmd, false),
+                "{cmd} must stay out of the Unix allowlist"
+            );
+        }
+        for cmd in ALLOWED_COMMANDS {
+            assert!(
+                is_allowed_command(cmd, true) && is_allowed_command(cmd, false),
+                "{cmd}"
+            );
+        }
+        for cmd in ["rm", "del", "rd", "format", "shutdown", "reg", "sudo"] {
+            for windows in [false, true] {
+                assert!(
+                    !is_allowed_command(cmd, windows),
+                    "{cmd} must not be allowlisted"
+                );
+            }
+        }
+    }
+
+    /// Tests that need Windows itself: cmd.exe, `taskkill`, Windows paths.
+    #[cfg(windows)]
+    mod windows_only {
+        use super::*;
+
+        const HELPER: &str = "tests::windows_only::helper_sleep_and_report_pid";
+
+        /// Not a test. The long-running child of the process-tree tests below: this test binary
+        /// run on its own (`--ignored`), reporting its pid in $RTK_MCP_TEST_PIDFILE and sleeping.
+        #[test]
+        #[ignore = "helper process of the process-tree tests"]
+        fn helper_sleep_and_report_pid() {
+            if let Some(file) = std::env::var_os("RTK_MCP_TEST_PIDFILE") {
+                std::fs::write(file, std::process::id().to_string()).unwrap();
+                std::thread::sleep(Duration::from_secs(300));
+            }
+        }
+
+        fn pidfile(name: &str) -> PathBuf {
+            let path =
+                std::env::temp_dir().join(format!("rtk-mcp-{}-{}.pid", name, std::process::id()));
+            let _ = std::fs::remove_file(&path);
+            path
+        }
+
+        /// cmd.exe running the helper: a two-level tree, like a shell running a scanner. With
+        /// `background` the helper is started with `start /B` and cmd.exe exits at once.
+        fn tree_command(pidfile: &Path, background: bool) -> Command {
+            let exe = std::env::current_exe().unwrap();
+            let helper = format!("\"{}\" --ignored --exact {HELPER}", exe.display());
+            let line = if background {
+                format!("start \"\" /B {helper}")
+            } else {
+                helper
+            };
+            let mut command = Shell::cmd().command(&line);
+            command.env("RTK_MCP_TEST_PIDFILE", pidfile);
+            Command::from(command)
+        }
+
+        fn process_alive(pid: u32) -> bool {
+            let out = std::process::Command::new("tasklist")
+                .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+                .output()
+                .expect("tasklist runs");
+            String::from_utf8_lossy(&out.stdout).contains(&format!("\"{pid}\""))
+        }
+
+        /// Poll until `pid` is gone; true if it died within ~10s.
+        async fn dies_soon(pid: u32) -> bool {
+            for _ in 0..100 {
+                if !process_alive(pid) {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            false
+        }
+
+        /// Wait (up to 20s) for the helper to report its pid.
+        async fn read_pid(pidfile: &Path) -> u32 {
+            for _ in 0..200 {
+                if let Ok(text) = std::fs::read_to_string(pidfile) {
+                    if let Ok(pid) = text.trim().parse() {
+                        return pid;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            panic!("the helper never reported its pid in {}", pidfile.display());
+        }
+
+        #[tokio::test]
+        async fn timeout_kills_the_whole_process_tree() {
+            let pidfile = pidfile("timeout");
+            let started = std::time::Instant::now();
+            let err = exec_with(tree_command(&pidfile, false), None, "test", limits(5))
+                .await
+                .err()
+                .expect("must time out");
+            assert!(err.contains("timed out after 5s"), "{}", err);
+            assert!(started.elapsed() < Duration::from_secs(30));
+            let child = read_pid(&pidfile).await;
+            assert!(
+                dies_soon(child).await,
+                "child {} survived the timeout",
+                child
+            );
+            let _ = std::fs::remove_file(&pidfile);
+        }
+
+        /// Same when the client cancels the request: rmcp drops the handler future mid-flight.
+        #[tokio::test]
+        async fn cancellation_kills_the_whole_process_tree() {
+            let pidfile = pidfile("cancel");
+            let mut call = Box::pin(exec_with(
+                tree_command(&pidfile, false),
+                None,
+                "test",
+                limits(120),
+            ));
+            let child = tokio::select! {
+                _ = &mut call => panic!("the call ended on its own"),
+                pid = read_pid(&pidfile) => pid,
+            };
+            drop(call);
+            assert!(
+                dies_soon(child).await,
+                "child {} survived the cancel",
+                child
+            );
+            let _ = std::fs::remove_file(&pidfile);
+        }
+
+        /// Git Bash starts a program by fork and exec, which leaves the new process without a
+        /// living parent: `taskkill /T` cannot find it, the job object the command runs in can.
+        #[tokio::test]
+        async fn timeout_kills_what_git_bash_started() {
+            let Some(shell) = Shell::posix() else { return };
+            let pidfile = pidfile("posix-timeout");
+            // the `sleep 1` first: /proc/$!/winpid names the forked shell until the exec is done
+            let line = format!(
+                "sleep 300 & sleep 1; cat /proc/$!/winpid > '{}'; wait",
+                pidfile.display().to_string().replace('\\', "/")
+            );
+            let err = exec_with(Command::from(shell.command(&line)), None, "test", limits(5))
+                .await
+                .err()
+                .expect("must time out");
+            assert!(err.contains("timed out after 5s"), "{}", err);
+            let sleeper = read_pid(&pidfile).await;
+            assert!(
+                dies_soon(sleeper).await,
+                "sleep {} survived the timeout",
+                sleeper
+            );
+            let _ = std::fs::remove_file(&pidfile);
+        }
+
+        /// A command that ends by itself may leave a job behind on purpose: the call neither
+        /// waits for it nor kills it.
+        #[tokio::test]
+        async fn a_background_job_is_left_alone_when_cmd_exits() {
+            let pidfile = pidfile("background");
+            let started = std::time::Instant::now();
+            let result = exec_with(tree_command(&pidfile, true), None, "test", limits(60))
+                .await
+                .unwrap();
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "waited {:?} on a background job",
+                started.elapsed()
+            );
+            assert!(result.success, "{}", result.output);
+            let job = read_pid(&pidfile).await;
+            assert!(process_alive(job), "background job {} was killed", job);
+            shell::kill_tree(job);
+            let _ = std::fs::remove_file(&pidfile);
+        }
+
+        /// The same through Git Bash: `sleep &` keeps the output pipes open, and the call returns
+        /// anyway, with the job still running.
+        #[tokio::test]
+        async fn a_posix_shell_background_job_returns_promptly_and_survives() {
+            let Some(shell) = Shell::posix() else { return };
+            let started = std::time::Instant::now();
+            // /proc/$!/winpid is the Windows pid of the job
+            let result = run_in_shell(&shell, "sleep 60 & cat /proc/$!/winpid", None)
+                .await
+                .unwrap();
+            assert!(
+                started.elapsed() < Duration::from_secs(30),
+                "waited {:?} on a background job",
+                started.elapsed()
+            );
+            assert!(result.success, "{}", result.output);
+            assert!(
+                result.output.contains("background process"),
+                "{}",
+                result.output
+            );
+            let job: u32 = result
+                .output
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .parse()
+                .unwrap_or_else(|_| panic!("no pid in {:?}", result.output));
+            assert!(process_alive(job), "background job {} was killed", job);
+            shell::kill_tree(job);
+        }
+
+        #[tokio::test]
+        async fn cmd_expands_variables_and_applies_leading_assignments() {
+            let cmd = Shell::cmd();
+            // unset: cmd leaves %NAME% as it is
+            let unset = run_in_shell(&cmd, "echo [%RTK_MCP_PROBE%]", None)
+                .await
+                .unwrap();
+            assert_eq!(unset.output.trim(), "[%RTK_MCP_PROBE%]");
+            let set = run_in_shell(&cmd, "RTK_MCP_PROBE=42 echo [%RTK_MCP_PROBE%]", None)
+                .await
+                .unwrap();
+            assert_eq!(set.output.trim(), "[42]");
+        }
+
+        /// Not a test. The `cmd.exe` launcher as a process of its own: this test binary run on its
+        /// own (`--ignored`), running $RTK_MCP_TEST_LAUNCH_LINE the way `rtk-mcp.exe
+        /// --rtk-mcp-cmd-launcher` does.
+        #[test]
+        #[ignore = "helper process of cmd_launcher_prints_utf8"]
+        fn helper_cmd_launcher() {
+            if let Some(line) = std::env::var_os("RTK_MCP_TEST_LAUNCH_LINE") {
+                let Shell::Cmd(cmd) = Shell::cmd() else {
+                    unreachable!("Shell::cmd is cmd.exe")
+                };
+                std::process::exit(shell::run_cmd_launcher(cmd.as_os_str(), &line));
+            }
+        }
+
+        /// What cmd.exe prints for its own commands is in the code page of the console it starts
+        /// in, so the launcher sets it before it starts cmd. `CREATE_NO_WINDOW` gives the launcher
+        /// a new console in the OEM code page, as it has when the server starts it: the case that
+        /// matters.
+        #[test]
+        fn cmd_launcher_prints_utf8_and_passes_the_exit_code() {
+            use std::os::windows::process::CommandExt;
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "tests::windows_only::helper_cmd_launcher",
+                ])
+                .env(
+                    "RTK_MCP_TEST_LAUNCH_LINE",
+                    "echo héllo 日本語 العربية& exit /b 7",
+                )
+                .stdin(Stdio::null())
+                .creation_flags(shell::CREATE_NO_WINDOW)
+                .output()
+                .expect("the launcher runs");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(stdout.contains("héllo 日本語 العربية"), "{stdout:?}");
+            assert_eq!(output.status.code(), Some(7), "{stdout:?}");
+        }
+
+        #[tokio::test]
+        async fn cmd_reports_the_exit_code_and_both_streams() {
+            let line = "echo to-stdout& echo to-stderr 1>&2& exit /b 3";
+            let result = run_in_shell(&Shell::cmd(), line, None).await.unwrap();
+            assert!(!result.success);
+            assert_eq!(result.exit_code, 3);
+            assert!(result.output.contains("to-stdout"), "{}", result.output);
+            assert!(result.output.contains("[stderr]"), "{}", result.output);
+            assert!(result.output.contains("to-stderr"), "{}", result.output);
+        }
+
+        /// `fs::canonicalize` returns `\\?\C:\…`, which cmd.exe refuses as a working directory.
+        #[tokio::test]
+        async fn cwd_reaches_cmd_and_bash_as_a_plain_path() {
+            let dir = scratch_dir("win cwd");
+            let cwd = with_jail(None, || validate_cwd(dir.to_str().unwrap())).unwrap();
+            assert!(
+                !cwd.to_string_lossy().starts_with(r"\\?\"),
+                "{}",
+                cwd.display()
+            );
+
+            let shown = run_in_shell(&Shell::cmd(), "cd", Some(&cwd)).await.unwrap();
+            assert!(
+                shown
+                    .output
+                    .trim()
+                    .eq_ignore_ascii_case(&cwd.to_string_lossy()),
+                "{} vs {}",
+                shown.output,
+                cwd.display()
+            );
+
+            if let Some(shell) = Shell::posix() {
+                // `pwd -W` prints the Windows form of the directory, with forward slashes
+                let shown = run_in_shell(&shell, "pwd -W", Some(&cwd)).await.unwrap();
+                let want = cwd.to_string_lossy().replace('\\', "/");
+                assert!(
+                    shown.output.trim().eq_ignore_ascii_case(&want),
+                    "{} vs {}",
+                    shown.output,
+                    want
+                );
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }

@@ -1,0 +1,232 @@
+name: Release
+
+# Pushing a tag vX.Y.Z builds rtk-mcp for every supported system, uploads the archives and
+# checksums.txt to that tag's GitHub release (creating it if it does not exist yet), and then
+# installs the Windows build the way a user would. A tag with a suffix (v0.6.0-rc.1) makes a
+# pre-release, which GitHub's "latest release" ignores.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # The RTK the built binaries are tested against.
+  RTK_VERSION: v1.1.0
+
+jobs:
+  check:
+    name: Tag matches Cargo.toml
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Compare
+        run: |
+          VERSION=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          if [ "${GITHUB_REF_NAME%%-*}" != "v$VERSION" ]; then
+            echo "tag $GITHUB_REF_NAME does not match version $VERSION in Cargo.toml"
+            exit 1
+          fi
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: check
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-musl, runner: ubuntu-24.04, python: python3, exe: "", test: true, rustflags: "" }
+          - { target: aarch64-unknown-linux-musl, runner: ubuntu-24.04-arm, python: python3, exe: "", test: true, rustflags: "" }
+          - { target: aarch64-apple-darwin, runner: macos-latest, python: python3, exe: "", test: true, rustflags: "" }
+          # built on the arm64 runner, so only checked for its architecture, not run
+          - { target: x86_64-apple-darwin, runner: macos-latest, python: python3, exe: "", test: false, rustflags: "" }
+          # static C runtime: no Visual C++ redistributable needed on the user's machine
+          - { target: x86_64-pc-windows-msvc, runner: windows-latest, python: python, exe: ".exe", test: true, rustflags: "-C target-feature=+crt-static" }
+    steps:
+      - name: Keep line endings as committed
+        if: runner.os == 'Windows'
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Install musl tools
+        if: contains(matrix.target, 'linux-musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Check the architecture
+        if: runner.os == 'macOS'
+        run: file target/${{ matrix.target }}/release/rtk-mcp | tee /dev/stderr | grep -q "${{ startsWith(matrix.target, 'x86_64') && 'x86_64' || 'arm64' }}"
+
+      - name: Install RTK ${{ env.RTK_VERSION }}
+        if: matrix.test
+        uses: ./.github/actions/install-rtk
+        with:
+          version: ${{ env.RTK_VERSION }}
+
+      # The same end-to-end suite CI runs, against the binary that is about to be released.
+      - name: MCP functional test
+        if: matrix.test
+        run: ${{ matrix.python }} tests/functional.py target/${{ matrix.target }}/release/rtk-mcp${{ matrix.exe }}
+
+      - name: Package (Linux, macOS)
+        if: runner.os != 'Windows'
+        env:
+          COPYFILE_DISABLE: "1"
+        run: |
+          mkdir -p dist stage
+          cp target/${{ matrix.target }}/release/rtk-mcp LICENSE stage/
+          tar -C stage -czf dist/rtk-mcp-${{ matrix.target }}.tar.gz rtk-mcp LICENSE
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          New-Item -ItemType Directory -Force -Path dist, stage | Out-Null
+          Copy-Item target\${{ matrix.target }}\release\rtk-mcp.exe, LICENSE -Destination stage
+          Compress-Archive -Path stage\rtk-mcp.exe, stage\LICENSE -DestinationPath dist\rtk-mcp-${{ matrix.target }}.zip
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish release assets
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          pattern: dist-*
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum rtk-mcp-* > checksums.txt
+          cat checksums.txt
+
+      # Signed build provenance for every file: `gh attestation verify <file> --repo
+      # admiralhr99/rtk-mcp` says which workflow run, on which commit, built it.
+      - name: Attest build provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/*
+
+      - name: Upload to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          PRERELEASE=""
+          case "$GITHUB_REF_NAME" in *-*) PRERELEASE="--prerelease" ;; esac
+          if ! gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag \
+              --title "$GITHUB_REF_NAME" --notes "Prebuilt binaries for $GITHUB_REF_NAME." $PRERELEASE
+          fi
+          gh release upload "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+
+  # Install from the published release the way README tells users to, with both PowerShells that
+  # ship with Windows, over a Claude Desktop config that already has another server in it. No RTK
+  # is on PATH here, so this also exercises the rtk.exe the installer puts beside the server.
+  verify-install:
+    name: Install on Windows
+    needs: publish
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Keep line endings as committed
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Provenance of the downloaded archive
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dl = Join-Path $env:RUNNER_TEMP 'dl'
+          gh release download $env:GITHUB_REF_NAME --repo $env:GITHUB_REPOSITORY --pattern 'rtk-mcp-x86_64-pc-windows-msvc.zip' --dir $dl
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          gh attestation verify (Join-Path $dl 'rtk-mcp-x86_64-pc-windows-msvc.zip') --repo $env:GITHUB_REPOSITORY
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dir = Join-Path $env:RUNNER_TEMP 'rtk-mcp-ps51'
+          $config = Join-Path $env:RUNNER_TEMP 'claude-ps51.json'
+          '{"mcpServers":{"other":{"command":"x","args":["a"]}},"theme":"dark"}' | Set-Content -Path $config -Encoding UTF8
+          .\install.ps1 -InstallDir $dir -Version $env:GITHUB_REF_NAME -ConfigPath $config
+          # again: an update over an existing install
+          .\install.ps1 -InstallDir $dir -Version $env:GITHUB_REF_NAME -ConfigPath $config
+          python tests/functional.py "$dir\rtk-mcp.exe" --installed $config
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: PowerShell 7, install folder with a space
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dir = Join-Path $env:RUNNER_TEMP 'rtk mcp pwsh'
+          $config = Join-Path $env:RUNNER_TEMP 'claude-pwsh.json'
+          '{"mcpServers":{"other":{"command":"x","args":["a"]}},"theme":"dark"}' | Set-Content -Path $config
+          .\install.ps1 -InstallDir $dir -Version $env:GITHUB_REF_NAME -ConfigPath $config
+          python tests/functional.py "$dir\rtk-mcp.exe" --installed $config
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      # Claude Desktop from the Microsoft Store keeps its config in its package folder; the
+      # installer has to edit that one and not create a second in %APPDATA%.
+      - name: Claude Desktop from the Microsoft Store
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dir = Join-Path $env:RUNNER_TEMP 'rtk-mcp-store'
+          $store = Join-Path $env:LOCALAPPDATA 'Packages\Claude_test123\LocalCache\Roaming\Claude'
+          New-Item -ItemType Directory -Force -Path $store | Out-Null
+          $config = Join-Path $store 'claude_desktop_config.json'
+          '{"mcpServers":{"other":{"command":"x","args":["a"]}},"theme":"dark"}' | Set-Content -Path $config
+          .\install.ps1 -InstallDir $dir -Version $env:GITHUB_REF_NAME
+          python tests/functional.py "$dir\rtk-mcp.exe" --installed $config
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          if (Test-Path (Join-Path $env:APPDATA 'Claude\claude_desktop_config.json')) {
+            throw 'a second config was created in %APPDATA% although the Store one exists'
+          }
+
+      # A final release only: "latest" is whatever the newest non-pre-release is, and a
+      # pre-release is not that.
+      - name: Latest release, default folder
+        if: ${{ !contains(github.ref_name, '-') }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $config = Join-Path $env:RUNNER_TEMP 'claude-latest.json'
+          '{"mcpServers":{"other":{"command":"x","args":["a"]}},"theme":"dark"}' | Set-Content -Path $config
+          .\install.ps1 -ConfigPath $config
+          python tests/functional.py "$env:LOCALAPPDATA\Programs\rtk-mcp\rtk-mcp.exe" --installed $config
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
