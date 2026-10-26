@@ -15,7 +15,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   # The RTK the built binaries are tested against.
-  RTK_VERSION: v0.49.0
+  RTK_VERSION: v1.1.0
 
 jobs:
   check:
@@ -90,14 +90,16 @@ jobs:
         env:
           COPYFILE_DISABLE: "1"
         run: |
-          mkdir -p dist
-          tar -C target/${{ matrix.target }}/release -czf dist/rtk-mcp-${{ matrix.target }}.tar.gz rtk-mcp
+          mkdir -p dist stage
+          cp target/${{ matrix.target }}/release/rtk-mcp LICENSE stage/
+          tar -C stage -czf dist/rtk-mcp-${{ matrix.target }}.tar.gz rtk-mcp LICENSE
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
         run: |
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Compress-Archive -Path target\${{ matrix.target }}\release\rtk-mcp.exe -DestinationPath dist\rtk-mcp-${{ matrix.target }}.zip
+          New-Item -ItemType Directory -Force -Path dist, stage | Out-Null
+          Copy-Item target\${{ matrix.target }}\release\rtk-mcp.exe, LICENSE -Destination stage
+          Compress-Archive -Path stage\rtk-mcp.exe, stage\LICENSE -DestinationPath dist\rtk-mcp-${{ matrix.target }}.zip
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

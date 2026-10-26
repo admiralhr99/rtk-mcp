@@ -55,7 +55,8 @@ else
         echo "ERROR: checksum verification failed for ${RTK_TARBALL} (expected '${EXPECTED}', got '${ACTUAL}') — refusing to install"
         exit 1
     fi
-    tar xzf "$TMP_DIR/$RTK_TARBALL" -C "$INSTALL_DIR"
+    # only the executable: RTK 1.x tarballs also hold its licence files
+    tar xzf "$TMP_DIR/$RTK_TARBALL" -C "$INSTALL_DIR" rtk
     echo "✓ RTK ${RTK_VERSION} installed to $INSTALL_DIR/rtk (checksum verified)"
 fi
 

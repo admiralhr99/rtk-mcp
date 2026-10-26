@@ -17,8 +17,12 @@ Where rtk-mcp.exe (and rtk.exe) go. Default: %LOCALAPPDATA%\Programs\rtk-mcp
 The rtk-mcp release to install, such as v0.6.0. Default: latest.
 
 .PARAMETER RtkVersion
-The RTK release to install when RTK is missing, such as v0.49.0 (the default, the one rtk-mcp is
-tested with). 'latest' takes the newest.
+The RTK release to install when RTK is missing, such as v1.1.0 (the default, the newest one
+rtk-mcp is tested with). 'latest' takes the newest.
+
+.PARAMETER RtkEdition
+Which RTK build to install when RTK is missing: 'full' (the default) is RTK's standard build, 'oss'
+is the Apache-2.0 build that RTK publishes from 1.0.0 on. rtk-mcp works with both.
 
 .PARAMETER NoConfig
 Install only; leave Claude Desktop's configuration alone.
@@ -36,7 +40,8 @@ irm https://raw.githubusercontent.com/admiralhr99/rtk-mcp/main/install.ps1 | iex
 param(
     [string]$InstallDir = (Join-Path $env:LOCALAPPDATA 'Programs\rtk-mcp'),
     [string]$Version = 'latest',
-    [string]$RtkVersion = 'v0.49.0',
+    [string]$RtkVersion = 'v1.1.0',
+    [ValidateSet('full', 'oss')][string]$RtkEdition = 'full',
     [switch]$NoConfig,
     [string]$ConfigPath
 )
@@ -48,7 +53,7 @@ $ProgressPreference = 'SilentlyContinue'  # the progress bar makes Invoke-WebReq
 
 $Repo = 'admiralhr99/rtk-mcp'
 $ServerAsset = 'rtk-mcp-x86_64-pc-windows-msvc.zip'
-$RtkAsset = 'rtk-x86_64-pc-windows-msvc.zip'
+$RtkAsset = if ($RtkEdition -eq 'oss') { 'rtk-oss-x86_64-pc-windows-msvc.zip' } else { 'rtk-x86_64-pc-windows-msvc.zip' }
 
 function Get-ReleaseBase([string]$Project, [string]$Tag) {
     if ($Tag -eq 'latest') { return "https://github.com/$Project/releases/latest/download" }
@@ -200,11 +205,15 @@ try {
     if ($rtk -and (Test-Rtk $rtk.Source)) {
         Write-Host "  RTK: already installed ($($rtk.Source))"
     } else {
-        Write-Host "Installing RTK ($RtkVersion) next to rtk-mcp ..."
+        if ($RtkEdition -eq 'oss' -and $RtkVersion -match '^v?0\.') {
+            throw "RTK publishes the oss build from 1.0.0 on, so $RtkVersion has none. Use -RtkVersion v1.1.0 or -RtkEdition full."
+        }
+        Write-Host "Installing RTK ($RtkVersion, $RtkEdition) next to rtk-mcp ..."
         $archive = Get-VerifiedAsset (Get-ReleaseBase 'rtk-ai/rtk' $RtkVersion) $RtkAsset $work
         $bundled = Install-FromArchive $archive 'rtk.exe'
         if (-not (Test-Rtk $bundled)) { throw "$bundled does not run as RTK." }
         Write-Host "  RTK: $bundled (SHA-256 verified)"
+        Write-Host '  RTK is a separate project with its own licence: https://github.com/rtk-ai/rtk (-RtkEdition oss installs its Apache-2.0 build).'
     }
 
     if ($NoConfig) {

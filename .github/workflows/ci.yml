@@ -19,17 +19,24 @@ env:
 
 jobs:
   build-and-test:
-    name: ${{ matrix.name }} / RTK ${{ matrix.rtk }}
+    name: ${{ matrix.name }} / RTK ${{ matrix.rtk }}${{ matrix.edition == 'oss' && ' (oss)' || '' }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         runner: [ubuntu-latest, macos-latest, windows-latest]
-        # Oldest RTK this server is tested against, and the current release. The protocol differs
-        # between them (`rtk rewrite` exits 0 vs 3 for a rewrite, pipelines are rewritten
-        # differently, `gain --recalls` only exists from 0.49).
-        rtk: [v0.34.3, v0.49.0]
+        # Oldest RTK this server is tested against, the last 0.x, and the current release. The
+        # protocol differs between them (`rtk rewrite` exits 0 vs 3 for a rewrite, pipelines are
+        # rewritten differently, `gain --recalls` only exists from 0.49, 1.0 renames `proxy` to
+        # `bypass`).
+        rtk: [v0.34.3, v0.49.0, v1.1.0]
+        # From 1.0.0 RTK ships two builds of the same CLI: the standard one and an Apache-2.0
+        # "oss" one. Both have to work.
+        edition: [full, oss]
+        exclude:
+          - { rtk: v0.34.3, edition: oss }
+          - { rtk: v0.49.0, edition: oss }
         include:
           - { runner: ubuntu-latest, name: Linux, python: python3, exe: "" }
           - { runner: macos-latest, name: macOS, python: python3, exe: "" }
@@ -65,10 +72,11 @@ jobs:
 
       # Pinned, checksum-verified release binary: fast, and not a moving target like
       # `cargo install --git`. Installed before the tests so the RTK-backed unit tests run too.
-      - name: Install RTK ${{ matrix.rtk }}
+      - name: Install RTK ${{ matrix.rtk }} (${{ matrix.edition }})
         uses: ./.github/actions/install-rtk
         with:
           version: ${{ matrix.rtk }}
+          edition: ${{ matrix.edition }}
 
       - name: RTK version
         run: rtk --version
