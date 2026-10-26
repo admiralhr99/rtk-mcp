@@ -115,6 +115,8 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -127,6 +129,13 @@ jobs:
         run: |
           sha256sum rtk-mcp-* > checksums.txt
           cat checksums.txt
+
+      # Signed build provenance for every file: `gh attestation verify <file> --repo
+      # admiralhr99/rtk-mcp` says which workflow run, on which commit, built it.
+      - name: Attest build provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/*
 
       - name: Upload to the release
         env:
@@ -154,6 +163,18 @@ jobs:
         run: git config --global core.autocrlf false
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Provenance of the downloaded archive
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dl = Join-Path $env:RUNNER_TEMP 'dl'
+          gh release download $env:GITHUB_REF_NAME --repo $env:GITHUB_REPOSITORY --pattern 'rtk-mcp-x86_64-pc-windows-msvc.zip' --dir $dl
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          gh attestation verify (Join-Path $dl 'rtk-mcp-x86_64-pc-windows-msvc.zip') --repo $env:GITHUB_REPOSITORY
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
       - name: Windows PowerShell 5.1
         shell: powershell
