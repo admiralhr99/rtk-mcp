@@ -40,8 +40,13 @@ FAILURES = []
 # Things that differ between a POSIX shell on Linux/macOS and Git Bash on Windows.
 PWD = "pwd -W" if IS_WINDOWS else "pwd"  # Git Bash: `pwd -W` prints the Windows form of the directory
 # The pid of the last background job, as the OS knows it. Git Bash starts a program by fork and exec,
-# and /proc/$!/winpid names the forked shell until the exec has happened, so it waits a moment.
-BG_PID = "$(sleep 1; cat /proc/$!/winpid)" if IS_WINDOWS else "$!"
+# and /proc/$!/winpid names the forked shell until the exec has happened, so it waits a moment. It
+# reads the file with the shell's own `read`: RTK 0.34.3 rewrites a `cat` it finds inside $( ) to
+# `rtk read`, a native program that cannot see Git Bash's /proc.
+BG_PID = "$(sleep 1; read -r p < /proc/$!/winpid; echo $p)" if IS_WINDOWS else "$!"
+# The timeout of the servers that time commands out: Git Bash needs a while to start, and the
+# command that records a background job's pid waits a second more.
+SHORT_TIMEOUT = 6 if IS_WINDOWS else 2
 # A path with no system dirs other than the basics, for the "RTK is missing" tests.
 BASIC_PATH = (
     os.pathsep.join(os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), d) for d in ("System32", ""))
@@ -372,17 +377,18 @@ def test_with_rtk(version):
 
 
 def test_runtime_robustness():
-    s = Server(extra_env={"RTK_MCP_TIMEOUT_SECS": "2", "RTK_MCP_MAX_OUTPUT_KB": "64"})
+    timed_out = "timed out after %ds" % SHORT_TIMEOUT
+    s = Server(extra_env={"RTK_MCP_TIMEOUT_SECS": str(SHORT_TIMEOUT), "RTK_MCP_MAX_OUTPUT_KB": "64"})
     try:
         err, text = s.call("run_command", command="echo partial-result; sleep 60")
         check("a timeout still returns the output printed so far",
-              err and "timed out after 2s" in text and "partial-result" in text, text)
+              err and timed_out in text and "partial-result" in text, text)
 
         pidfile = os.path.join(s.project, "grandchild.pid")
         started = time.time()
         err, text = s.call("run_command", command="sleep 300 & echo %s > %s; wait" % (BG_PID, sh_path(pidfile)))
-        check("timeout is reported", err and "timed out after 2s" in text, text)
-        check("timeout returns promptly", time.time() - started < 15, time.time() - started)
+        check("timeout is reported", err and timed_out in text, text)
+        check("timeout returns promptly", time.time() - started < SHORT_TIMEOUT + 13, time.time() - started)
         try:
             pid = read_pid(pidfile)
             check("timeout killed the grandchild too (whole process tree)", wait_dead(pid), "pid %d alive" % pid)
