@@ -1079,7 +1079,10 @@ def test_windows(version, bash_path):
             check("no Git: cmd.exe is the fallback", "/d /s /c" in s.log().lower(), s.log()[-300:])
             check("no RTK: the startup log says so", "RTK not found" in s.log(), s.log()[-300:])
             err, text = s.call("run_command", command="echo %RTK_FUNC_TOKEN%")
-            check("no Git, no RTK: echo works", not err and text.strip() == "pipe-ok", text)
+            # without RTK the first result ends with the note about install_rtk
+            check("no Git, no RTK: echo works", not err and text.strip().startswith("pipe-ok"), text)
+            check("no Git, no RTK: the first result says RTK is missing and names install_rtk",
+                  "RTK is not installed" in text and "install_rtk" in text, text)
             err, text = s.call("run_command", command="dir /b", cwd=s.project)
             check("no RTK: dir is allowed on Windows", not err and ".claude" in text, text)
             err, text = s.call("run_command", command="where cmd")
