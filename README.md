@@ -2,6 +2,8 @@
 
 MCP server bridge for [RTK (Rust Token Killer)](https://github.com/rtk-ai/rtk) — token-optimized CLI output for any MCP-compatible client. Runs on Linux, macOS and Windows.
 
+It installs RTK itself when RTK is missing (the `install_rtk` tool, [details](#rtk-itself)) and asks the model to use it for shell commands, so there is nothing to put in your own preferences or system prompt. How far the second part goes depends on the client, see [Getting the model to use it](#getting-the-model-to-use-it).
+
 ## Measured
 
 Same command, raw vs. through rtk-mcp. Sizes are what the model has to read. RTK 1.1.0, Linux.
@@ -17,6 +19,8 @@ The whole `cargo test` result is one line: `cargo test: 76 passed (1 suite, 4.42
 The filtering is RTK's work; rtk-mcp is the bridge that lets MCP clients such as Claude Desktop use it. RTK summarizes, so it is lossy by design (`ls -la` drops owner and timestamps, `git diff` is condensed). When you need every line, prefix the command with `RTK_DISABLED=1` and you get the raw output.
 
 To reproduce, compare `<command> | wc -c` with `rtk <command> | wc -c`. Numbers vary with the repo, the machine and the RTK version.
+
+What it costs: the tool descriptions and the server instructions are read once per conversation. For the nine tools of 0.7.0 that is 10.2 KB (about 2,500 tokens at 4 bytes per token); the four tools of 0.6.0 were 7.0 KB. The `git diff` above saves 121 KB, so one large output pays that back, but a conversation that only runs short commands costs more than it saves.
 
 Platforms: Linux, macOS and Windows, with prebuilt binaries for each. What is tested where is under [Platforms](#platforms).
 
@@ -38,7 +42,7 @@ MCP Client (Claude Desktop, Cursor, Windsurf, ...)
     → returns to LLM
 ```
 
-Without RTK installed, all commands execute directly (no filtering, no token savings). On Windows the command line goes to Git Bash or `cmd.exe` instead of `sh` ([details](#windows-which-shell-runs-the-command)).
+Without RTK installed, commands execute directly (no filtering, no token savings), and the result tells the model it can call `install_rtk` ([details](#rtk-itself)). On Windows the command line goes to Git Bash or `cmd.exe` instead of `sh` ([details](#windows-which-shell-runs-the-command)).
 
 ## Why
 
@@ -80,7 +84,7 @@ Total: **5.3M tokens saved** across 4,876 commands.
 | Commands run under | `sh -c` | `sh -c` | Git Bash if Git for Windows is installed, else `cmd.exe` |
 | Unit + end-to-end tests in CI | `ubuntu-latest` | `macos-latest` (Apple silicon) | `windows-latest` |
 
-Every push to `main` and every pull request runs the unit tests and an end-to-end test over real MCP stdio (tool surface, RTK routing, deny rules, timeouts and process-tree kill, truncation, the no-RTK allowlist) on all three systems, against RTK 0.34.3, 0.49.0 and 1.1.0 (the standard build) and 1.1.0 `oss`. On Windows it also covers both shells, UTF-8 output and an `rtk.exe` installed next to the server. When a release is built, the binaries that are about to be published run the same test, and the Windows archive is installed with `install.ps1` under Windows PowerShell 5.1 and PowerShell 7.
+Every push to `main` and every pull request runs the unit tests and an end-to-end test over real MCP stdio (tool surface, RTK routing, deny rules, timeouts and process-tree kill, truncation, the no-RTK allowlist, where RTK is found, and, in the jobs on the RTK that `install_rtk` pins, a real `install_rtk` download) on all three systems, against RTK 0.34.3, 0.49.0 and 1.1.0 (the standard build) and 1.1.0 `oss`. On Windows it also covers both shells, UTF-8 output and an `rtk.exe` installed next to the server. When a release is built, the binaries that are about to be published run the same test, and the Windows archive is installed with `install.ps1` under Windows PowerShell 5.1 and PowerShell 7.
 
 What that does not cover:
 
@@ -144,7 +148,17 @@ Or run `./install.sh` from a checkout: it downloads RTK if it is missing (SHA-25
 
 ### RTK itself
 
-rtk-mcp needs [RTK](https://github.com/rtk-ai/rtk) for the token savings. The Windows installer fetches it for you; elsewhere install it first (any of its official methods):
+rtk-mcp needs [RTK](https://github.com/rtk-ai/rtk) for the token savings, but you do not have to install it first. Without RTK the server still runs commands, unfiltered, and the result says so; the model can then call the `install_rtk` tool, which
+
+- downloads the RTK release this version of rtk-mcp pins (v1.1.0) from `github.com/rtk-ai/rtk` with `curl`, over HTTPS only,
+- compares the archive's SHA-256 with the checksum compiled into rtk-mcp, which is copied from RTK's own `checksums.txt` for that release (CI compares the copy with upstream), and installs nothing if they differ,
+- unpacks the single `rtk` executable, writes it to `~/.local/bin` (`%USERPROFILE%\.local\bin` on Windows; `RTK_MCP_INSTALL_DIR` changes it) and uses it from then on, with no restart.
+
+The tool takes no parameters, so the model cannot pick a URL or a version, and it does nothing when a working RTK is already there. It needs `curl` (included with macOS, Windows 10 and later, and most Linux distributions). Prebuilt RTK exists for Linux x86_64 and arm64, macOS and Windows x86_64; on any other system the tool says so and names the manual route. Three settings: `RTK_MCP_NO_INSTALL=1` removes the tool and every mention of it, `RTK_MCP_AUTO_INSTALL=1` makes the server install RTK by itself at startup when it is missing (off by default, so nothing is downloaded unless you or the model ask for it), and `RTK_MCP_RTK_EDITION=oss` installs the Apache-2.0 build.
+
+An RTK that is already on the machine is found without any of this, also when the client starts the server with a short `PATH` (Claude Desktop often leaves out `~/.local/bin`, `~/.cargo/bin` and Homebrew's directory). The places, in order: `RTK_MCP_RTK_PATH`, the folder of the rtk-mcp executable, the `PATH`, then the usual install directories (`RTK_MCP_INSTALL_DIR` if set, `~/.local/bin`, `~/.cargo/bin`, `/opt/homebrew/bin`, `/usr/local/bin` and Linuxbrew's; Scoop shims and WinGet links on Windows). A file named `rtk` that does not behave like RTK (another program, a damaged file) is skipped, and `get_rtk_status` lists what was skipped.
+
+To install RTK yourself instead (any of its official methods):
 
 ```bash
 brew install rtk                                  # macOS / Linux
@@ -210,16 +224,35 @@ Add to your MCP settings (check each client's documentation for the exact config
 }
 ```
 
+## Getting the model to use it
+
+Having the server installed is not enough on its own: the model has to choose `run_command` over whatever else it can run commands with. rtk-mcp does what a server can do about that, so you do not have to write it into your own preferences or system prompt:
+
+- **The `run_command` description opens with the instruction**: "Run a shell command through RTK, which cuts the tokens in its output by 60-90%. Use this for ALL shell commands (git, ls, cat, grep, find, cargo, npm, docker, curl, tests, scripts) instead of any other shell, terminal or command tool." Every client shows tool descriptions to the model, so this is the part that works everywhere.
+- **The server instructions say it again.** rtk-mcp also sends the rule in the `instructions` field of the MCP handshake. A client that puts that field into the system prompt (Claude Code does) gives the model the rule before the first message. Claude Desktop is reported not to pass the field on ([anthropics/claude-code#43749](https://github.com/anthropics/claude-code/issues/43749), one user's reading of the app, not confirmed by Anthropic), which is why the description carries the rule too.
+- **A missing RTK is announced where the model will see it**: the first `run_command` result without RTK, and every 20th after it, ends with a note that names `install_rtk`.
+
+What this cannot do: no server can make a client pick its tool. A description is a strong hint, not a rule. When other tools can run commands too (a built-in terminal tool, Desktop Commander, another shell server) the model chooses among them, and in some conversations it will choose another. If you need it to be certain, remove the competing shell tools, or put one line in your own instructions ("Use run_command for shell commands"). Claude Code can do better without relying on the model's choice: RTK's own hook (`rtk init -g`) filters its Bash tool directly.
+
 ## Tools
 
 | Tool | Description |
 |------|-------------|
 | `run_command` | Execute any shell command with automatic RTK filtering |
+| `install_rtk` | Install RTK when it is missing: the pinned release, SHA-256 verified, used at once ([details](#rtk-itself)) |
+| `get_rtk_status` | Which RTK is in use (path, version, how it was found), the mode, the limits, what this RTK version supports, and the installer's plan |
 | `get_rtk_savings` | Token savings statistics (`rtk gain`): graph, history, daily/weekly/monthly, failures, recalls, quota, JSON/CSV |
 | `get_rtk_discover` | Find missed RTK savings from Claude Code history (`rtk discover`) |
 | `get_rtk_session` | Show RTK adoption across recent sessions |
+| `get_rtk_recall` | The original text of output RTK shortened (`rtk recall`, RTK 0.49+): by hash, as a list, or a range or regex of it |
+| `get_rtk_rewrite` | What RTK would do with a command, without running it: the rewritten form, no filter, or refused by a deny rule |
+| `get_rtk_config` | RTK's current configuration (`rtk config`) |
 
-The three stats tools are read-only (`readOnlyHint`), so clients can auto-approve them. `rtk gain --reset` is deliberately not reachable.
+Every tool except `run_command` and `install_rtk` is read-only (`readOnlyHint`), so clients can auto-approve them. `install_rtk` writes one file; it is marked non-destructive and idempotent, and a client that asks before running tools should ask for it. `rtk gain --reset` is deliberately not reachable.
+
+RTK's other subcommands are left out on purpose: the ones that change its setup or trust (`init`, `config --create`, `trust`, `untrust`, `telemetry`) and the ones about Claude Code's own hooks, spending or RTK plugin development (`verify`, `learn`, `cc-economics`, `llm-proxy`, `pipeline`, `plugins`). RTK's output filters (`rtk err`, `rtk read`, `rtk test`, ...) need no tool of their own: `rtk` is on the `PATH` of every command, so `run_command` runs them.
+
+With RTK older than 0.49, `get_rtk_recall` answers with the version it needs instead of running: RTK takes an unknown subcommand for a program to execute.
 
 ### `run_command` parameters
 
@@ -276,6 +309,26 @@ The model is told which shell it is writing for (the `run_command` description n
 | `limit` | integer | Max commands per section (default 15) |
 | `format` | enum | `text` (default), `json` |
 
+### `get_rtk_recall` parameters
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `hash` | string | Hash from an RTK recall hint (a unique prefix is enough). Not needed with `list` |
+| `list` | bool | List the stored entries instead of recalling one |
+| `full` | bool | The complete output, not just the part RTK left out |
+| `from` | integer | Start at this 1-based line of the full output |
+| `lines` | integer | Only the first N lines of the full output |
+| `grep` | string | Only the lines matching this regex |
+
+### `get_rtk_rewrite` parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `command` | string | Yes | The command to preview, as you would pass it to `run_command`. It is never run |
+| `cwd` | string | No | Working directory; project-level deny rules are looked up from here. Same rules as for `run_command` |
+
+`install_rtk`, `get_rtk_status` and `get_rtk_config` take no parameters.
+
 Example tool calls from the LLM:
 
 ```json
@@ -283,6 +336,8 @@ Example tool calls from the LLM:
 {"name": "run_command", "arguments": {"command": "cargo test | grep FAILED"}}
 {"name": "run_command", "arguments": {"command": "ls -la src/"}}
 {"name": "run_command", "arguments": {"command": "nmap -sV 10.0.0.1"}}
+{"name": "get_rtk_recall", "arguments": {"hash": "a1b2c3", "grep": "error"}}
+{"name": "get_rtk_rewrite", "arguments": {"command": "git status && cargo build"}}
 ```
 
 ## Security
@@ -290,6 +345,8 @@ Example tool calls from the LLM:
 ### Command filtering
 
 When RTK is available, `rtk rewrite` is the gate. Its exit code decides: `1` means RTK has no filter (the command runs as given), `0`/`3` mean rewritten (run the rewrite), and `2` means a `permissions.deny` rule in your Claude settings (`~/.claude/settings.json`, or the project's `.claude/settings.json` found from `cwd`) matches — the command is refused and never executed. `allow`/`ask` rules are not enforced: your MCP client's approval prompt for `run_command` is the gate for those. When RTK is absent and `RTK_MCP_ALLOW_ALL` is not set, the built-in allowlist is enforced.
+
+The allowlist ends when RTK appears. With RTK present, installed by hand or through `install_rtk` while the server runs, any command may run, and the deny rules plus your client's approval prompt are the gates. The allowlist is a speed bump rather than a sandbox anyway (it includes `bash`, `sh` and `zsh`), but if you rely on it, set `RTK_MCP_NO_INSTALL=1` so the model cannot install RTK and so lift it.
 
 **Allowlist** (enforced only when RTK is absent and `RTK_MCP_ALLOW_ALL` is unset): `git`, `cargo`, `npm`, `npx`, `pnpm`, `pytest`, `ruff`, `mypy`, `pip`, `uv`, `go`, `golangci-lint`, `docker`, `grep`, `find`, `ls`, `cat`, `head`, `tail`, `wc`, `env`, `echo`, `pwd`, `gh`, `curl`, `wget`, `node`, `tsc`, `next`, `prettier`, `eslint`, `biome`, `playwright`, `prisma`, `vitest`, `dotnet`, `psql`, `make`, `tree`, `bash`, `sh`, `zsh`, `tar`, `unzip`, `zip`, `nmap`, `nuclei`, `httpx`, `aws`, `kubectl`, and more. On Windows it also has `cmd`, `powershell`, `pwsh`, `dir`, `findstr`, `where`, `ipconfig`, `tasklist`, `hostname` and `systeminfo`; a directory and an `.exe` suffix are ignored when matching, so `C:\Windows\System32\HOSTNAME.EXE` counts as `hostname`.
 
@@ -301,6 +358,7 @@ When RTK is available, `rtk rewrite` is the gate. Its exit code decides: `1` mea
 - **Bounded memory**: at most 4× the output cap (1MB by default) is held per stream while a command runs (the rest is drained), and 256KB is returned (`RTK_MCP_MAX_OUTPUT_KB`) — truncation is UTF-8 safe
 - **Working-directory jail**: set `RTK_MCP_CWD_JAIL=/some/root` and a `cwd` outside it (after `..` and symlinks are resolved) is refused before anything runs. It guards the `cwd` parameter only — it is not a sandbox: the command itself can still `cd` elsewhere or name absolute paths
 - **Quiet children**: `RTK_SUPPRESS_HOOK_WARNING=1` is set for child processes (unless you set it) so RTK's daily "no hook installed" nag never reaches the LLM
+- **Installer**: `install_rtk` takes no parameters and fetches one fixed URL over HTTPS (`curl`, TLS 1.2 or newer, 100 MB and 150 s limits). It refuses an archive whose SHA-256 is not the one compiled into rtk-mcp, unpacks one file (the `rtk` executable, at most 128 MiB) and writes it through a temporary file and a rename. The only thing it then runs is `rtk --version` and a test `rtk rewrite`, to see that the file is a working RTK; if that fails the file is removed
 - **Length limit**: Commands capped at 4096 characters
 - **RTK validation**: Verifies `rtk rewrite` works correctly at startup
 - **Exit code propagation**: Failed commands return `isError: true` in MCP response
@@ -339,11 +397,16 @@ When RTK is available, `rtk rewrite` is the gate. Its exit code decides: `1` mea
 | `RTK_MCP_TIMEOUT_SECS` | `300` | Command execution timeout in seconds (a positive number; anything else uses the default) |
 | `RTK_MCP_MAX_OUTPUT_KB` | `256` | Largest output returned to the LLM, in KB (a positive number; anything else uses the default) |
 | `RTK_MCP_CWD_JAIL` | unset | Directory that every `cwd` must lie inside |
-| `RTK_MCP_ALLOW_ALL` | `1` if RTK is installed, else `0` | Bypass the built-in command allowlist |
+| `RTK_MCP_ALLOW_ALL` | `1` if RTK is installed, else `0` | Bypass the built-in command allowlist. It only matters while RTK is missing |
 | `RTK_MCP_SHELL` | `auto` | Windows only: `auto`, `bash`, `cmd` or the path of a POSIX shell, see [which shell runs the command](#windows-which-shell-runs-the-command). Ignored elsewhere |
+| `RTK_MCP_RTK_PATH` | unset | The `rtk` executable to use, tried before every other place. One that is not a working RTK is skipped and reported by `get_rtk_status` |
+| `RTK_MCP_NO_INSTALL` | unset | `1`: never download anything; the `install_rtk` tool and every mention of it are left out |
+| `RTK_MCP_AUTO_INSTALL` | unset | `1`: when no RTK is found at startup, install the pinned one in the background |
+| `RTK_MCP_INSTALL_DIR` | `~/.local/bin` (`%USERPROFILE%\.local\bin`) | Where `install_rtk` puts `rtk`; it is searched like the other usual directories |
+| `RTK_MCP_RTK_EDITION` | `full` | `oss`: install the Apache-2.0 build of RTK (`rtk-oss`) |
 | `RTK_SUPPRESS_HOOK_WARNING` | `1` for children | Set by the server unless you set it yourself |
 
-The server resolves `rtk` through `PATH`. To pin a specific RTK, put its directory first in `PATH` in your client's `env` block.
+To pin a specific RTK, set `RTK_MCP_RTK_PATH` in your client's `env` block. Where RTK is looked for otherwise is under [RTK itself](#rtk-itself).
 
 ## Development
 
@@ -357,6 +420,7 @@ cargo build --release
 # End-to-end test over real MCP stdio (uses the `rtk` on PATH in a throwaway HOME)
 python3 tests/functional.py                    # Windows: python tests\functional.py
 python3 tests/functional.py path/to/rtk-mcp    # another binary
+RTK_MCP_TEST_NETWORK=1 python3 tests/functional.py   # also downloads RTK from GitHub, to test install_rtk for real
 
 # Test MCP protocol manually
 echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}' | ./target/release/rtk-mcp
@@ -364,7 +428,7 @@ echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":
 
 The Windows-specific code is in `src/shell.rs`. Most of it (choosing the shell, quoting a command line for `cmd.exe`, finding Git Bash, matching program names) is plain string and path logic that compiles and is unit-tested on every system; only the few calls into Windows itself (the console code page, job objects) are `cfg(windows)`. Building on Windows needs the MSVC build tools (`rustup` explains how to get them).
 
-CI (`.github/workflows/ci.yml`) runs formatting, clippy, the unit tests, a release build and the end-to-end test on Linux, macOS and Windows, once per RTK version in its matrix. RTK is installed from a pinned release and checked against that release's `checksums.txt` (`.github/actions/install-rtk`).
+CI (`.github/workflows/ci.yml`) runs formatting, clippy, the unit tests, a release build and the end-to-end test on Linux, macOS and Windows, once per RTK version in its matrix. RTK is installed from a pinned release and checked against that release's `checksums.txt` (`.github/actions/install-rtk`). The download tests are off on your machine unless you set `RTK_MCP_TEST_NETWORK=1` (`=0` rules them out everywhere); on GitHub Actions they run by themselves in the jobs whose RTK is the release `install_rtk` pins. There the end-to-end test downloads RTK through `install_rtk` itself and compares the hashes compiled into rtk-mcp (`data/rtk-checksums-<tag>.txt`) with RTK's published `checksums.txt`. To move `install_rtk` to a newer RTK: change the tag in `src/install.rs`, put that release's `checksums.txt` at `data/rtk-checksums-<tag>.txt`, and add the version to the CI matrix.
 
 Releases: push a tag `vX.Y.Z` that matches `Cargo.toml`. `.github/workflows/release.yml` builds the five targets, runs the end-to-end test on the ones it can run, uploads the archives and `checksums.txt`, attests their provenance and installs the Windows archive with `install.ps1` under both PowerShells. A tag with a suffix (`v0.7.0-rc.1`) makes a pre-release.
 
