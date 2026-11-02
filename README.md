@@ -2,7 +2,7 @@
 
 MCP server bridge for [RTK (Rust Token Killer)](https://github.com/rtk-ai/rtk) — token-optimized CLI output for any MCP-compatible client. Runs on Linux, macOS and Windows.
 
-It installs RTK itself when RTK is missing (the `install_rtk` tool, [details](#rtk-itself)) and asks the model to use it for shell commands, so there is nothing to put in your own preferences or system prompt. How far the second part goes depends on the client, see [Getting the model to use it](#getting-the-model-to-use-it).
+It installs RTK itself when RTK is missing and upgrades an older RTK to the latest release (the `install_rtk` tool, [details](#rtk-itself)), and it asks the model to use RTK for shell commands, so there is nothing to put in your own preferences or system prompt. How far the last part goes depends on the client, see [Getting the model to use it](#getting-the-model-to-use-it).
 
 ## Measured
 
@@ -20,7 +20,7 @@ The filtering is RTK's work; rtk-mcp is the bridge that lets MCP clients such as
 
 To reproduce, compare `<command> | wc -c` with `rtk <command> | wc -c`. Numbers vary with the repo, the machine and the RTK version.
 
-What it costs: the tool descriptions and the server instructions are read once per conversation. For the nine tools of 0.7.0 that is 10.2 KB (about 2,500 tokens at 4 bytes per token); the four tools of 0.6.0 were 7.0 KB. The `git diff` above saves 121 KB, so one large output pays that back, but a conversation that only runs short commands costs more than it saves.
+What it costs: the tool descriptions and the server instructions are read once per conversation. For the nine tools of 0.8.0 that is 10.5 KB (about 2,600 tokens at 4 bytes per token); 0.7.0 had the same nine tools in 10.2 KB, and the four tools of 0.6.0 were 7.0 KB. The `git diff` above saves 121 KB, so one large output pays that back, but a conversation that only runs short commands costs more than it saves.
 
 Platforms: Linux, macOS and Windows, with prebuilt binaries for each. What is tested where is under [Platforms](#platforms).
 
@@ -42,7 +42,7 @@ MCP Client (Claude Desktop, Cursor, Windsurf, ...)
     → returns to LLM
 ```
 
-Without RTK installed, commands execute directly (no filtering, no token savings), and the result tells the model it can call `install_rtk` ([details](#rtk-itself)). On Windows the command line goes to Git Bash or `cmd.exe` instead of `sh` ([details](#windows-which-shell-runs-the-command)).
+Without RTK installed, commands execute directly (no filtering, no token savings), and the result tells the model it can call `install_rtk`; an RTK that is out of date is reported by `get_rtk_status`, and `install_rtk` upgrades it ([details](#rtk-itself)). On Windows the command line goes to Git Bash or `cmd.exe` instead of `sh` ([details](#windows-which-shell-runs-the-command)).
 
 ## Why
 
@@ -84,7 +84,7 @@ Total: **5.3M tokens saved** across 4,876 commands.
 | Commands run under | `sh -c` | `sh -c` | Git Bash if Git for Windows is installed, else `cmd.exe` |
 | Unit + end-to-end tests in CI | `ubuntu-latest` | `macos-latest` (Apple silicon) | `windows-latest` |
 
-Every push to `main` and every pull request runs the unit tests and an end-to-end test over real MCP stdio (tool surface, RTK routing, deny rules, timeouts and process-tree kill, truncation, the no-RTK allowlist, where RTK is found, and, in the jobs on the RTK that `install_rtk` pins, a real `install_rtk` download) on all three systems, against RTK 0.34.3, 0.49.0 and 1.1.0 (the standard build) and 1.1.0 `oss`. On Windows it also covers both shells, UTF-8 output and an `rtk.exe` installed next to the server. When a release is built, the binaries that are about to be published run the same test, and the Windows archive is installed with `install.ps1` under Windows PowerShell 5.1 and PowerShell 7.
+Every push to `main` and every pull request runs the unit tests and an end-to-end test over real MCP stdio (tool surface, RTK routing, deny rules, timeouts and process-tree kill, truncation, the no-RTK allowlist, where RTK is found, and two kinds of real download from GitHub: `install_rtk` installing the latest RTK where there is none, in the jobs whose RTK is the release `install_rtk` pins, and `install_rtk` upgrading an older RTK in place, in every job) on all three systems, against RTK 0.34.3, 0.49.0 and 1.1.0 (the standard build) and 1.1.0 `oss`. On Windows it also covers both shells, UTF-8 output and an `rtk.exe` installed next to the server. When a release is built, the binaries that are about to be published run the same test, and the Windows archive is installed with `install.ps1` under Windows PowerShell 5.1 and PowerShell 7.
 
 What that does not cover:
 
@@ -148,13 +148,25 @@ Or run `./install.sh` from a checkout: it downloads RTK if it is missing (SHA-25
 
 ### RTK itself
 
-rtk-mcp needs [RTK](https://github.com/rtk-ai/rtk) for the token savings, but you do not have to install it first. Without RTK the server still runs commands, unfiltered, and the result says so; the model can then call the `install_rtk` tool, which
+rtk-mcp needs [RTK](https://github.com/rtk-ai/rtk) for the token savings, but you do not have to install it first, or keep it up to date by hand. Without RTK the server still runs commands, unfiltered, and the result says so; `get_rtk_status` says when the RTK in use is older than the release this rtk-mcp was built with. In both cases the model can call the `install_rtk` tool, which
 
-- downloads the RTK release this version of rtk-mcp pins (v1.1.0) from `github.com/rtk-ai/rtk` with `curl`, over HTTPS only,
-- compares the archive's SHA-256 with the checksum compiled into rtk-mcp, which is copied from RTK's own `checksums.txt` for that release (CI compares the copy with upstream), and installs nothing if they differ,
-- unpacks the single `rtk` executable, writes it to `~/.local/bin` (`%USERPROFILE%\.local\bin` on Windows; `RTK_MCP_INSTALL_DIR` changes it) and uses it from then on, with no restart.
+- asks GitHub which release is the latest (it reads where `github.com/rtk-ai/rtk/releases/latest` redirects to: no API, no token) and downloads that release's archive for your system from `github.com/rtk-ai/rtk` with `curl`, over HTTPS only,
+- compares the archive's SHA-256 with the expected one and installs nothing if they differ (see below for where the hash comes from),
+- **with no RTK on the machine**, unpacks the single `rtk` executable and writes it to `~/.local/bin` (`%USERPROFILE%\.local\bin` on Windows; `RTK_MCP_INSTALL_DIR` changes it),
+- **with an RTK that is older than the latest release**, replaces it where it is (see below),
+- **with an RTK that is as new as the latest release, or newer**, does nothing: it never downgrades,
 
-The tool takes no parameters, so the model cannot pick a URL or a version, and it does nothing when a working RTK is already there. It needs `curl` (included with macOS, Windows 10 and later, and most Linux distributions). Prebuilt RTK exists for Linux x86_64 and arm64, macOS and Windows x86_64; on any other system the tool says so and names the manual route. Three settings: `RTK_MCP_NO_INSTALL=1` removes the tool and every mention of it, `RTK_MCP_AUTO_INSTALL=1` makes the server install RTK by itself at startup when it is missing (off by default, so nothing is downloaded unless you or the model ask for it), and `RTK_MCP_RTK_EDITION=oss` installs the Apache-2.0 build.
+and then uses the result from the next command on, with no restart.
+
+**Upgrading.** The new executable is written next to the old one, run once to see that it works, and only then renamed over the old file, so a failed download, a wrong hash or a broken file leaves the old RTK as it was. rtk-mcp does not touch RTK's settings, hooks or history. Only a plain file in a directory the server can write to is replaced. An RTK behind a symbolic link (what Homebrew and winget create), next to a Scoop `.shim` file, in a read-only directory such as `/usr/bin`, or whose version cannot be read is left alone: `install_rtk` answers with an error that says why and how to update it the way you installed it (`brew upgrade rtk`, `winget upgrade rtk-ai.rtk`, `scoop update rtk`), so the model does not take the job for done. From RTK 1.0 the standard and the Apache-2.0 builds print the same version, so rtk-mcp cannot tell which one it is replacing: an upgrade installs the build `RTK_MCP_RTK_EDITION` names (the standard one by default) and the answer says which.
+
+**Where the hash comes from.** For the release this rtk-mcp was built with (v1.1.0 in 0.8.0) it is compiled into rtk-mcp, copied from RTK's own `checksums.txt` for that release (CI compares the copy with upstream). For a newer release there is nothing compiled in, so it is the `checksums.txt` published with that release. That file comes from the same place as the archive: it catches a damaged or half-uploaded download, or a mirror that serves something else, but not a release that was replaced at the source, which a hash compiled into rtk-mcp does catch. If you want that guarantee for every install, set `RTK_MCP_RTK_VERSION=pinned`: the installer then goes only for the release rtk-mcp carries the hashes of, and a newer RTK arrives with a newer rtk-mcp. Whichever you pick, the answer of `install_rtk` names the release and where the hash came from.
+
+If GitHub cannot be asked which release is the latest (a proxy that blocks that page, no network), `install_rtk` falls back on the release rtk-mcp was built with, and the answer says so.
+
+`get_rtk_status` never goes online: it compares the RTK in use with the release rtk-mcp was built with. A release newer than that is found when `install_rtk` runs, by the model on request or by the server itself at startup with `RTK_MCP_AUTO_INSTALL=1`. The install scripts put RTK on the machine when it is missing too (`install.sh` takes the latest release, `install.ps1` takes v1.1.0 unless `-RtkVersion` says otherwise); `install_rtk` takes it from there.
+
+The tool takes no parameters, so the model cannot pick a URL or a version. It needs `curl` (included with macOS, Windows 10 and later, and most Linux distributions). Prebuilt RTK exists for Linux x86_64 and arm64, macOS and Windows x86_64; on any other system the tool says so and names the manual route. Four settings: `RTK_MCP_NO_INSTALL=1` removes the tool and every mention of it, `RTK_MCP_AUTO_INSTALL=1` makes the server install a missing RTK, or upgrade an old one, by itself at startup in the background (off by default, so nothing is downloaded unless you or the model ask for it), `RTK_MCP_RTK_VERSION=pinned` restricts the installer to the pinned release, and `RTK_MCP_RTK_EDITION=oss` installs the Apache-2.0 build.
 
 An RTK that is already on the machine is found without any of this, also when the client starts the server with a short `PATH` (Claude Desktop often leaves out `~/.local/bin`, `~/.cargo/bin` and Homebrew's directory). The places, in order: `RTK_MCP_RTK_PATH`, the folder of the rtk-mcp executable, the `PATH`, then the usual install directories (`RTK_MCP_INSTALL_DIR` if set, `~/.local/bin`, `~/.cargo/bin`, `/opt/homebrew/bin`, `/usr/local/bin` and Linuxbrew's; Scoop shims and WinGet links on Windows). A file named `rtk` that does not behave like RTK (another program, a damaged file) is skipped, and `get_rtk_status` lists what was skipped.
 
@@ -239,7 +251,7 @@ What this cannot do: no server can make a client pick its tool. A description is
 | Tool | Description |
 |------|-------------|
 | `run_command` | Execute any shell command with automatic RTK filtering |
-| `install_rtk` | Install RTK when it is missing: the pinned release, SHA-256 verified, used at once ([details](#rtk-itself)) |
+| `install_rtk` | Install RTK when it is missing, or upgrade an older one in place, to the latest release: SHA-256 verified, used at once ([details](#rtk-itself)) |
 | `get_rtk_status` | Which RTK is in use (path, version, how it was found), the mode, the limits, what this RTK version supports, and the installer's plan |
 | `get_rtk_savings` | Token savings statistics (`rtk gain`): graph, history, daily/weekly/monthly, failures, recalls, quota, JSON/CSV |
 | `get_rtk_discover` | Find missed RTK savings from Claude Code history (`rtk discover`) |
@@ -248,7 +260,7 @@ What this cannot do: no server can make a client pick its tool. A description is
 | `get_rtk_rewrite` | What RTK would do with a command, without running it: the rewritten form, no filter, or refused by a deny rule |
 | `get_rtk_config` | RTK's current configuration (`rtk config`) |
 
-Every tool except `run_command` and `install_rtk` is read-only (`readOnlyHint`), so clients can auto-approve them. `install_rtk` writes one file; it is marked non-destructive and idempotent, and a client that asks before running tools should ask for it. `rtk gain --reset` is deliberately not reachable.
+Every tool except `run_command` and `install_rtk` is read-only (`readOnlyHint`), so clients can auto-approve them. `install_rtk` writes one file, and when it upgrades it replaces an existing RTK executable, so it is marked as destructive (and idempotent): a client that asks before running tools should ask for it. `rtk gain --reset` is deliberately not reachable.
 
 RTK's other subcommands are left out on purpose: the ones that change its setup or trust (`init`, `config --create`, `trust`, `untrust`, `telemetry`) and the ones about Claude Code's own hooks, spending or RTK plugin development (`verify`, `learn`, `cc-economics`, `llm-proxy`, `pipeline`, `plugins`). RTK's output filters (`rtk err`, `rtk read`, `rtk test`, ...) need no tool of their own: `rtk` is on the `PATH` of every command, so `run_command` runs them.
 
@@ -358,7 +370,7 @@ The allowlist ends when RTK appears. With RTK present, installed by hand or thro
 - **Bounded memory**: at most 4× the output cap (1MB by default) is held per stream while a command runs (the rest is drained), and 256KB is returned (`RTK_MCP_MAX_OUTPUT_KB`) — truncation is UTF-8 safe
 - **Working-directory jail**: set `RTK_MCP_CWD_JAIL=/some/root` and a `cwd` outside it (after `..` and symlinks are resolved) is refused before anything runs. It guards the `cwd` parameter only — it is not a sandbox: the command itself can still `cd` elsewhere or name absolute paths
 - **Quiet children**: `RTK_SUPPRESS_HOOK_WARNING=1` is set for child processes (unless you set it) so RTK's daily "no hook installed" nag never reaches the LLM
-- **Installer**: `install_rtk` takes no parameters and fetches one fixed URL over HTTPS (`curl`, TLS 1.2 or newer, 100 MB and 150 s limits). It refuses an archive whose SHA-256 is not the one compiled into rtk-mcp, unpacks one file (the `rtk` executable, at most 128 MiB) and writes it through a temporary file and a rename. The only thing it then runs is `rtk --version` and a test `rtk rewrite`, to see that the file is a working RTK; if that fails the file is removed
+- **Installer**: `install_rtk` takes no parameters. It talks to `github.com/rtk-ai/rtk` only (over HTTPS with `curl`, TLS 1.2 or newer, 100 MB and 150 s limits): the page that names the latest release, that release's `checksums.txt` and its archive for your system. The tag it reads off the redirect has to be a plain `vN.N.N` of that repository, or the lookup counts as failed (GitHub's page for the latest release never names a pre-release). It refuses an archive whose SHA-256 is not the expected one (compiled into rtk-mcp for the pinned release, from the release's own `checksums.txt` for a newer one, see [RTK itself](#rtk-itself) for what that does and does not prove), unpacks one file (the `rtk` executable, at most 128 MiB) and writes it through a temporary file and a rename. The only thing it runs is the new file, as `rtk --version` and a test `rtk rewrite`, before it replaces anything: a file that is not a working RTK, or one older than the RTK it would replace, is removed and the old one stays
 - **Length limit**: Commands capped at 4096 characters
 - **RTK validation**: Verifies `rtk rewrite` works correctly at startup
 - **Exit code propagation**: Failed commands return `isError: true` in MCP response
@@ -401,9 +413,10 @@ The allowlist ends when RTK appears. With RTK present, installed by hand or thro
 | `RTK_MCP_SHELL` | `auto` | Windows only: `auto`, `bash`, `cmd` or the path of a POSIX shell, see [which shell runs the command](#windows-which-shell-runs-the-command). Ignored elsewhere |
 | `RTK_MCP_RTK_PATH` | unset | The `rtk` executable to use, tried before every other place. One that is not a working RTK is skipped and reported by `get_rtk_status` |
 | `RTK_MCP_NO_INSTALL` | unset | `1`: never download anything; the `install_rtk` tool and every mention of it are left out |
-| `RTK_MCP_AUTO_INSTALL` | unset | `1`: when no RTK is found at startup, install the pinned one in the background |
-| `RTK_MCP_INSTALL_DIR` | `~/.local/bin` (`%USERPROFILE%\.local\bin`) | Where `install_rtk` puts `rtk`; it is searched like the other usual directories |
-| `RTK_MCP_RTK_EDITION` | `full` | `oss`: install the Apache-2.0 build of RTK (`rtk-oss`) |
+| `RTK_MCP_AUTO_INSTALL` | unset | `1`: at startup, in the background, install RTK when none is found and upgrade the one in use when it is older than the latest release (what `install_rtk` does, without being asked) |
+| `RTK_MCP_RTK_VERSION` | `latest` | `latest`: `install_rtk` goes for the latest release. `pinned`: only for the release this rtk-mcp carries the hashes of (v1.1.0 in 0.8.0). Any other value makes the installer refuse and `get_rtk_status` say so |
+| `RTK_MCP_INSTALL_DIR` | `~/.local/bin` (`%USERPROFILE%\.local\bin`) | Where a first `install_rtk` puts `rtk`; it is searched like the other usual directories. An upgrade replaces the RTK where it is |
+| `RTK_MCP_RTK_EDITION` | `full` | `oss`: install the Apache-2.0 build of RTK (`rtk-oss`), also when upgrading |
 | `RTK_SUPPRESS_HOOK_WARNING` | `1` for children | Set by the server unless you set it yourself |
 
 To pin a specific RTK, set `RTK_MCP_RTK_PATH` in your client's `env` block. Where RTK is looked for otherwise is under [RTK itself](#rtk-itself).
@@ -420,7 +433,7 @@ cargo build --release
 # End-to-end test over real MCP stdio (uses the `rtk` on PATH in a throwaway HOME)
 python3 tests/functional.py                    # Windows: python tests\functional.py
 python3 tests/functional.py path/to/rtk-mcp    # another binary
-RTK_MCP_TEST_NETWORK=1 python3 tests/functional.py   # also downloads RTK from GitHub, to test install_rtk for real
+RTK_MCP_TEST_NETWORK=1 python3 tests/functional.py   # also downloads RTK from GitHub, to test install_rtk (install, upgrade, latest) for real
 
 # Test MCP protocol manually
 echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}' | ./target/release/rtk-mcp
@@ -428,7 +441,7 @@ echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":
 
 The Windows-specific code is in `src/shell.rs`. Most of it (choosing the shell, quoting a command line for `cmd.exe`, finding Git Bash, matching program names) is plain string and path logic that compiles and is unit-tested on every system; only the few calls into Windows itself (the console code page, job objects) are `cfg(windows)`. Building on Windows needs the MSVC build tools (`rustup` explains how to get them).
 
-CI (`.github/workflows/ci.yml`) runs formatting, clippy, the unit tests, a release build and the end-to-end test on Linux, macOS and Windows, once per RTK version in its matrix. RTK is installed from a pinned release and checked against that release's `checksums.txt` (`.github/actions/install-rtk`). The download tests are off on your machine unless you set `RTK_MCP_TEST_NETWORK=1` (`=0` rules them out everywhere); on GitHub Actions they run by themselves in the jobs whose RTK is the release `install_rtk` pins. There the end-to-end test downloads RTK through `install_rtk` itself and compares the hashes compiled into rtk-mcp (`data/rtk-checksums-<tag>.txt`) with RTK's published `checksums.txt`. To move `install_rtk` to a newer RTK: change the tag in `src/install.rs`, put that release's `checksums.txt` at `data/rtk-checksums-<tag>.txt`, and add the version to the CI matrix.
+CI (`.github/workflows/ci.yml`) runs formatting, clippy, the unit tests, a release build and the end-to-end test on Linux, macOS and Windows, once per RTK version in its matrix. RTK is installed from a pinned release and checked against that release's `checksums.txt` (`.github/actions/install-rtk`). The download tests are off on your machine unless you set `RTK_MCP_TEST_NETWORK=1` (`=0` rules them out everywhere). On GitHub Actions the upgrade tests run in every job (an older RTK, a copy of the job's own where that is older than the pinned release, is replaced through `install_rtk`), and the install tests run by themselves in the jobs whose RTK is the release `install_rtk` pins: `install_rtk` downloads the pinned release and the latest one, and the hashes compiled into rtk-mcp (`data/rtk-checksums-<tag>.txt`) are compared with RTK's published `checksums.txt`. Where GitHub's page for the latest release cannot be read (a sandbox proxy), the tests expect the pinned release instead and say so; on GitHub Actions that is a failure. The release `install_rtk` falls back on, and the one `RTK_MCP_RTK_VERSION=pinned` selects, only moves when you change the tag in `src/install.rs`, put that release's `checksums.txt` at `data/rtk-checksums-<tag>.txt` and add the version to the CI matrix; `install_rtk` itself goes for the latest release without any of that.
 
 Releases: push a tag `vX.Y.Z` that matches `Cargo.toml`. `.github/workflows/release.yml` builds the five targets, runs the end-to-end test on the ones it can run, uploads the archives and `checksums.txt`, attests their provenance and installs the Windows archive with `install.ps1` under both PowerShells. A tag with a suffix (`v0.7.0-rc.1`) makes a pre-release.
 
