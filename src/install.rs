@@ -607,7 +607,8 @@ fn replace_file(staged: &Path, target: &Path) -> std::io::Result<()> {
     };
     #[cfg(windows)]
     {
-        if target.exists() {
+        // only a file can be a running executable; a directory in the way stays where it is
+        if target.is_file() {
             let aside = aside_name(target);
             if std::fs::rename(target, &aside).is_ok() {
                 return match std::fs::rename(staged, target) {
