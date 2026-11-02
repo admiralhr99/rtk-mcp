@@ -1,7 +1,11 @@
+mod install;
+mod rtk;
 mod shell;
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -18,7 +22,7 @@ use rmcp::{
     transport::stdio,
     RoleServer, ServerHandler, ServiceExt,
 };
-use shell::Shell;
+use shell::{RealMachine, Shell};
 use tracing_subscriber::EnvFilter;
 
 /// Maximum command string length (prevents memory abuse).
@@ -170,48 +174,52 @@ fn is_allowed_command(base: &str, windows: bool) -> bool {
 #[derive(Debug, Clone)]
 pub struct RtkMcpServer {
     tool_router: ToolRouter<Self>,
-    rtk_available: bool,
-    /// `rtk --version` output (e.g. "rtk 0.49.0"), used in error hints for the stats tools.
-    rtk_version: Option<String>,
-    allow_all: bool,
 }
 
 impl RtkMcpServer {
     pub fn new() -> Self {
-        let rtk_version = detect_rtk();
-        let rtk_available = rtk_version.is_some();
-        // When RTK is present it acts as the safety net, so allow_all defaults to true.
-        // When RTK is absent the built-in allowlist is the only guard, so default to false.
-        let allow_all = std::env::var("RTK_MCP_ALLOW_ALL")
-            .map(|v| v == "1" || v.to_lowercase() == "true")
-            .unwrap_or(rtk_available);
-
-        if let Some(version) = &rtk_version {
-            tracing::info!("{version} detected — commands will be routed through rtk rewrite");
-        } else {
-            tracing::warn!("RTK not found — commands will execute without filtering");
+        // Which RTK is in use (if any) is settled here and again whenever `install_rtk`,
+        // `get_rtk_status` or the "RTK is missing" hint asks: an RTK that appears while the server
+        // runs is picked up without a restart.
+        adopt(rtk::search());
+        match rtk::current() {
+            Some(rtk) => tracing::info!(
+                "{} detected at {} ({}) — commands will be routed through rtk rewrite",
+                rtk.version,
+                rtk.path.display(),
+                rtk.origin.describe()
+            ),
+            None if install::disabled() => {
+                tracing::warn!("RTK not found — commands will execute without filtering");
+            }
+            None => tracing::warn!(
+                "RTK not found — commands will execute without filtering; the install_rtk tool \
+                 can install it"
+            ),
         }
-        if allow_all && !rtk_available {
+        if allow_all() && rtk::current().is_none() {
             tracing::warn!("RTK_MCP_ALLOW_ALL=1 — allowlist bypassed, all commands permitted");
         }
         // The shell is chosen, and logged, once at startup (on Windows this is where Git Bash is
         // looked for); the tool descriptions then say which one it is.
         let mut tool_router = Self::tool_router();
         describe_shell(&mut tool_router, Shell::current());
-
-        Self {
-            tool_router,
-            rtk_available,
-            rtk_version,
-            allow_all,
+        // With installing turned off there is nothing for the tool to do, so it is not offered.
+        if install::disabled() {
+            tool_router.map.remove("install_rtk");
         }
+
+        Self { tool_router }
     }
 
     /// Run an `rtk` subcommand directly (no shell). A non-zero exit becomes a tool error, with the
     /// installed version added when the failure is an option that RTK predates.
     async fn run_rtk(&self, args: &[String], cwd: Option<&Path>) -> Result<String, String> {
+        let Some(rtk) = rtk::current() else {
+            return Err(format!("RTK not installed.\nInstall: {}", install_hint()));
+        };
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        let result = run_with_timeout("rtk", &args, cwd).await?;
+        let result = run_with_timeout(&rtk.path, &args, cwd).await?;
         if result.success {
             return Ok(result.output);
         }
@@ -219,13 +227,48 @@ impl RtkMcpServer {
         output.push_str(&format!("\n[exit code: {}]", result.exit_code));
         // clap's wording for an option or subcommand the installed RTK doesn't know yet
         let predates = output.contains("unexpected argument") || output.contains("unrecognized");
-        if let (true, Some(version)) = (predates, &self.rtk_version) {
+        if predates {
             output.push_str(&format!(
-                "\n[installed: {version} — it predates this option; upgrade RTK to use it]"
+                "\n[installed: {} — it predates this option; upgrade RTK to use it]",
+                rtk.version
             ));
         }
         Err(output)
     }
+}
+
+/// Make the outcome of a search the RTK in use, logging what was passed over. What was passed
+/// over is returned too, for `get_rtk_status`.
+fn adopt(search: rtk::Search) -> Vec<String> {
+    for note in &search.skipped {
+        tracing::warn!("{note}");
+    }
+    rtk::set_current(search.found);
+    search.skipped
+}
+
+/// Search for RTK again, off the async threads (each candidate is probed by running it).
+async fn rescan() -> Vec<String> {
+    match tokio::task::spawn_blocking(rtk::search).await {
+        Ok(search) => adopt(search),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Is the allowlist off? With RTK present its own deny rules are the guard, so the allowlist is
+/// not needed; without RTK it is the only guard, unless `RTK_MCP_ALLOW_ALL` turns it off.
+fn allow_all() -> bool {
+    allow_all_from(
+        std::env::var("RTK_MCP_ALLOW_ALL").ok().as_deref(),
+        rtk::current().is_some(),
+    )
+}
+
+/// [`allow_all`] for a given `RTK_MCP_ALLOW_ALL` value and RTK state. An explicit setting wins.
+fn allow_all_from(setting: Option<&str>, rtk_present: bool) -> bool {
+    setting
+        .map(|v| v == "1" || v.to_lowercase() == "true")
+        .unwrap_or(rtk_present)
 }
 
 impl Default for RtkMcpServer {
@@ -305,6 +348,42 @@ struct GetRtkDiscoverRequest {
 
     #[schemars(description = "Output format: text (default) or json.")]
     format: Option<DiscoverFormat>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct GetRtkRecallRequest {
+    #[schemars(
+        description = "Hash from an RTK recall hint (a unique prefix is enough). Not needed with \
+        list=true."
+    )]
+    hash: Option<String>,
+
+    #[schemars(description = "List the stored entries instead of recalling one.")]
+    list: Option<bool>,
+
+    #[schemars(description = "Return the complete output, not just the part RTK left out.")]
+    full: Option<bool>,
+
+    #[schemars(description = "Start at this 1-based line of the full output.")]
+    from: Option<u32>,
+
+    #[schemars(description = "Return only the first N lines of the full output.")]
+    lines: Option<u32>,
+
+    #[schemars(description = "Keep only the lines matching this regex.")]
+    grep: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct GetRtkRewriteRequest {
+    #[schemars(description = "The command to preview, as you would pass it to run_command.")]
+    command: String,
+
+    #[schemars(
+        description = "Working directory; project-level deny rules are looked up from here. \
+        Defaults to server cwd."
+    )]
+    cwd: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
@@ -435,13 +514,52 @@ fn discover_args(req: &GetRtkDiscoverRequest) -> Vec<String> {
     args
 }
 
+/// Build the `rtk recall` argv (same `--opt=value` convention as `gain_args`). The hash goes after
+/// `--`, so nothing a client sends can be mistaken for an option.
+fn recall_args(req: &GetRtkRecallRequest) -> Result<Vec<String>, String> {
+    let list = req.list.unwrap_or(false);
+    let hash = req
+        .hash
+        .as_deref()
+        .map(str::trim)
+        .filter(|hash| !hash.is_empty());
+    if !list && hash.is_none() {
+        return Err(
+            "pass the hash from a recall hint, or list=true to see what is stored".to_string(),
+        );
+    }
+    let mut args = vec!["recall".to_string()];
+    if list {
+        args.push("--list".to_string());
+    }
+    if req.full.unwrap_or(false) {
+        args.push("--full".to_string());
+    }
+    if let Some(from) = req.from {
+        args.push(format!("--from={from}"));
+    }
+    if let Some(lines) = req.lines {
+        args.push(format!("--lines={lines}"));
+    }
+    if let Some(grep) = &req.grep {
+        args.push(format!("--grep={grep}"));
+    }
+    if let (false, Some(hash)) = (list, hash) {
+        args.push("--".to_string());
+        args.push(hash.to_string());
+    }
+    Ok(args)
+}
+
 #[tool_router]
 impl RtkMcpServer {
     #[tool(
         name = "run_command",
-        description = "Execute ANY shell command through RTK for token-optimized output. \
-            Uses `rtk rewrite` to route commands through the appropriate RTK filter (60-90% \
-            token savings). Commands without an RTK filter execute directly with full output. \
+        description = "Run a shell command through RTK, which cuts the tokens in its output by \
+            60-90%. Use this for ALL shell commands (git, ls, cat, grep, find, cargo, npm, docker, \
+            curl, tests, scripts) instead of any other shell, terminal or command tool. \
+            Uses `rtk rewrite` to route commands through the appropriate RTK filter. \
+            Commands without an RTK filter execute directly with full output. \
             RTK filters, among others, git, cargo, go, docker, kubectl, aws, gh, curl, grep, \
             find, ls, jq, pytest, ruff, mypy, tsc, vitest, rspec and rubocop (the exact set \
             depends on the RTK version). It has no filter for security scanners such as nmap, \
@@ -488,10 +606,18 @@ impl RtkMcpServer {
         // The working directory must exist and, when RTK_MCP_CWD_JAIL is set, lie inside it.
         let cwd = cwd.as_deref().map(validate_cwd).transpose()?;
 
+        // While RTK is missing, the first command and then every 20th looks for it again (it may
+        // have been installed by hand since) and ends with a note on how to install it.
+        let hint = rtk::current().is_none() && missing_hint_due();
+        if hint {
+            rescan().await;
+        }
+        let rtk = rtk::current();
+
         // Enforce allowlist only when RTK is absent AND allow_all is false.
         // When RTK is available, `rtk rewrite` decides what it can filter;
         // unknown commands fall back to direct execution anyway.
-        if !self.allow_all && !self.rtk_available {
+        if rtk.is_none() && !allow_all() {
             let program = shell::program_of(&command, cfg!(windows))?;
             let base_cmd = shell::base_command(&program, cfg!(windows));
             if !is_allowed_command(&base_cmd, cfg!(windows)) {
@@ -508,8 +634,8 @@ impl RtkMcpServer {
         // rewrite returns the token-optimized form (e.g. "cargo test | rtk grep FAILED")
         // or nothing if RTK has no filter for the command. It also enforces the deny rules
         // from the user's Claude settings (exit 2) — a denied command is never executed.
-        let effective_command = if self.rtk_available {
-            match get_rtk_rewrite(&command, cwd.as_deref()).await {
+        let effective_command = match &rtk {
+            Some(rtk) => match rewrite_via(&rtk.path, &command, cwd.as_deref()).await {
                 Rewrite::Rewritten(rewritten) => rewritten,
                 Rewrite::Passthrough => command.clone(),
                 Rewrite::Denied => {
@@ -519,9 +645,8 @@ impl RtkMcpServer {
                         command
                     ));
                 }
-            }
-        } else {
-            command.clone()
+            },
+            None => command.clone(),
         };
 
         // A client can cancel the call (`notifications/cancelled`). rmcp does not drop the handler
@@ -537,6 +662,9 @@ impl RtkMcpServer {
         let mut output = result.output;
         if !result.success {
             output.push_str(&format!("\n[exit code: {}]", result.exit_code));
+        }
+        if hint && rtk.is_none() {
+            output.push_str(&format!("\n[rtk-mcp: {}]", missing_note()));
         }
 
         if result.success {
@@ -563,11 +691,8 @@ impl RtkMcpServer {
         &self,
         Parameters(request): Parameters<GetRtkSavingsRequest>,
     ) -> Result<String, String> {
-        if !self.rtk_available {
-            return Ok(format!(
-                "RTK not installed — no savings data available.\nInstall: {}",
-                install_hint()
-            ));
+        if rtk::current().is_none() {
+            return Ok(rtk_missing("no savings data available"));
         }
         let cwd = request.cwd.as_deref().map(validate_cwd).transpose()?;
         self.run_rtk(&gain_args(&request), cwd.as_deref()).await
@@ -589,11 +714,8 @@ impl RtkMcpServer {
         &self,
         Parameters(request): Parameters<GetRtkDiscoverRequest>,
     ) -> Result<String, String> {
-        if !self.rtk_available {
-            return Ok(format!(
-                "RTK not installed — discovery unavailable.\nInstall: {}",
-                install_hint()
-            ));
+        if rtk::current().is_none() {
+            return Ok(rtk_missing("discovery unavailable"));
         }
         self.run_rtk(&discover_args(&request), None).await
     }
@@ -608,13 +730,147 @@ impl RtkMcpServer {
         )
     )]
     async fn get_rtk_session(&self) -> Result<String, String> {
-        if !self.rtk_available {
-            return Ok(format!(
-                "RTK not installed — session data unavailable.\nInstall: {}",
-                install_hint()
-            ));
+        if rtk::current().is_none() {
+            return Ok(rtk_missing("session data unavailable"));
         }
         self.run_rtk(&["session".to_string()], None).await
+    }
+
+    #[tool(
+        name = "install_rtk",
+        description = "Install RTK, the output filter run_command is built around, when it is \
+            missing: downloads the release pinned in this server from GitHub, checks its SHA-256 \
+            and starts using it at once (no restart). Does nothing if RTK is already installed. \
+            Call it when a run_command result says RTK is not installed.",
+        annotations(
+            title = "Install RTK",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn install_rtk(&self) -> Result<String, String> {
+        // RTK may have appeared since the server started (the user installed it by hand).
+        rescan().await;
+        if let Some(rtk) = rtk::current() {
+            return Ok(format!(
+                "RTK is already installed: {} at {} ({}). Nothing to install.{}",
+                rtk.version,
+                rtk.path.display(),
+                rtk.origin.describe(),
+                upgrade_note(&rtk)
+            ));
+        }
+        let done = install::run().await?;
+        Ok(format!(
+            "Installed {} at {} (from {}; its SHA-256, {}, is the one pinned in rtk-mcp). \
+             run_command routes through it from now on — no restart needed. The directory was not \
+             added to your shell's PATH. With RTK present, commands are checked by RTK's own \
+             rewrite and the deny rules in your Claude settings instead of the built-in allowlist.",
+            done.rtk.version,
+            done.rtk.path.display(),
+            done.asset,
+            done.sha256
+        ))
+    }
+
+    #[tool(
+        name = "get_rtk_status",
+        description = "Show which RTK this server uses (path, version, how it was found), the \
+            mode it runs in, its limits and what the installed RTK version supports. Also looks \
+            again for an RTK installed since the server started.",
+        annotations(title = "RTK status", read_only_hint = true, open_world_hint = false)
+    )]
+    async fn get_rtk_status(&self) -> Result<String, String> {
+        let skipped = rescan().await;
+        Ok(status_report(&skipped))
+    }
+
+    #[tool(
+        name = "get_rtk_recall",
+        description = "Fetch the original output of a command whose output RTK shortened (RTK \
+            0.49+). Pass the hash from the recall hint; full, from, lines and grep select the \
+            part you want. list=true shows what is stored.",
+        annotations(title = "RTK recall", read_only_hint = true, open_world_hint = false)
+    )]
+    async fn get_rtk_recall(
+        &self,
+        Parameters(request): Parameters<GetRtkRecallRequest>,
+    ) -> Result<String, String> {
+        let Some(rtk) = rtk::current() else {
+            return Ok(rtk_missing("nothing to recall"));
+        };
+        // An RTK that predates the subcommand would take `recall` for a program to run.
+        if !rtk.at_least(rtk::RECALL_SINCE) {
+            return Err(format!(
+                "{} predates `rtk recall`, which needs RTK {} or later; upgrade RTK to use it.",
+                rtk.version,
+                rtk::RECALL_SINCE
+            ));
+        }
+        self.run_rtk(&recall_args(&request)?, None).await
+    }
+
+    #[tool(
+        name = "get_rtk_config",
+        description = "Show RTK's current configuration (read-only).",
+        annotations(
+            title = "RTK configuration",
+            read_only_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn get_rtk_config(&self) -> Result<String, String> {
+        if rtk::current().is_none() {
+            return Ok(rtk_missing("no configuration to show"));
+        }
+        self.run_rtk(&["config".to_string()], None).await
+    }
+
+    #[tool(
+        name = "get_rtk_rewrite",
+        description = "Preview what RTK would do with a command without running it: the \
+            rewritten form, no filter, or refused by a deny rule in the user's Claude settings.",
+        annotations(
+            title = "RTK rewrite preview",
+            read_only_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn get_rtk_rewrite(
+        &self,
+        Parameters(GetRtkRewriteRequest { command, cwd }): Parameters<GetRtkRewriteRequest>,
+    ) -> Result<String, String> {
+        let command = command.trim().to_string();
+        if command.is_empty() {
+            return Err("Error: empty command".to_string());
+        }
+        if command.len() > MAX_COMMAND_LEN {
+            return Err(format!(
+                "Command too long: {} > {} chars",
+                command.len(),
+                MAX_COMMAND_LEN
+            ));
+        }
+        let cwd = cwd.as_deref().map(validate_cwd).transpose()?;
+        let Some(rtk) = rtk::current() else {
+            return Ok(rtk_missing("there is no rewrite to preview"));
+        };
+        Ok(
+            match rewrite_via(&rtk.path, &command, cwd.as_deref()).await {
+                Rewrite::Rewritten(rewritten) => format!("Rewritten: {rewritten}"),
+                Rewrite::Passthrough => {
+                    "No RTK filter for this command: run_command runs it exactly as written."
+                        .to_string()
+                }
+                Rewrite::Denied => {
+                    "Denied: a deny rule in your Claude settings (permissions.deny) \
+                matches this command, so run_command would refuse it."
+                        .to_string()
+                }
+            },
+        )
     }
 }
 
@@ -661,29 +917,155 @@ fn describe_shell(router: &mut ToolRouter<RtkMcpServer>, shell: &Shell) {
     tool.input_schema = Arc::new(schema);
 }
 
-/// How to install RTK, for the stats tools when it is missing.
-fn install_hint() -> &'static str {
-    if cfg!(windows) {
+/// How to install RTK, for the messages that say it is missing.
+fn install_hint() -> String {
+    let manual = if cfg!(windows) {
         "winget install rtk-ai.rtk"
     } else {
         "cargo install --git https://github.com/rtk-ai/rtk"
+    };
+    if install::disabled() {
+        manual.to_string()
+    } else {
+        format!("call the install_rtk tool, or run: {manual}")
     }
 }
 
-/// Windows: keep a console window from flashing up for a probe.
-fn hide_console(command: &mut std::process::Command) {
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(shell::CREATE_NO_WINDOW);
+/// What the tools that need RTK answer while it is missing.
+fn rtk_missing(what: &str) -> String {
+    format!("RTK not installed — {what}.\nInstall: {}", install_hint())
+}
+
+/// The note at the end of a `run_command` result while RTK is missing.
+fn missing_note() -> String {
+    if install::disabled() {
+        format!(
+            "RTK is not installed, so this output is not filtered. Install it ({}); rtk-mcp \
+             picks it up without a restart.",
+            install_hint()
+        )
+    } else {
+        "RTK is not installed, so output is not filtered (RTK typically cuts git, cargo, ls and \
+         similar output by 60-90%). Call the install_rtk tool to install it: the download is \
+         SHA-256 verified and no restart is needed."
+            .to_string()
     }
-    #[cfg(not(windows))]
-    let _ = command;
+}
+
+/// How many commands pass between two "RTK is missing" notes.
+const HINT_EVERY: usize = 20;
+
+/// Does the note go on this command? Counted over the commands run while RTK is missing: the
+/// first one, then every [`HINT_EVERY`]th.
+fn missing_hint_due() -> bool {
+    static COMMANDS: AtomicUsize = AtomicUsize::new(0);
+    hint_due(COMMANDS.fetch_add(1, Ordering::Relaxed))
+}
+
+fn hint_due(commands_so_far: usize) -> bool {
+    commands_so_far.is_multiple_of(HINT_EVERY)
+}
+
+/// When an RTK that is in use is older than the one this server installs.
+fn upgrade_note(rtk: &rtk::Rtk) -> String {
+    let pinned = rtk::parse_version(&format!("rtk {}", install::TAG.trim_start_matches('v')));
+    match (rtk::parse_version(&rtk.version), pinned) {
+        (Some(have), Some(pinned)) if have < pinned => format!(
+            " This server installs RTK {pinned}, which is newer: update RTK the way you \
+             installed it, or delete {} and call install_rtk again.",
+            rtk.path.display()
+        ),
+        _ => String::new(),
+    }
+}
+
+/// What `get_rtk_status` answers.
+fn status_report(skipped: &[String]) -> String {
+    let limits = Limits::from_env();
+    let mut lines = vec![format!(
+        "rtk-mcp {} on {} {}",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    )];
+    match rtk::current() {
+        Some(rtk) => {
+            lines.push(format!(
+                "RTK: {} at {} ({})",
+                rtk.version,
+                rtk.path.display(),
+                rtk.origin.describe()
+            ));
+            lines.push(
+                "Mode: every command goes through `rtk rewrite`; RTK filters what it has a \
+                 filter for and enforces the deny rules in your Claude settings (no allowlist)"
+                    .to_string(),
+            );
+            lines.push(if rtk.at_least(rtk::RECALL_SINCE) {
+                "Recall (get_rtk_recall): available".to_string()
+            } else {
+                format!("Recall (get_rtk_recall): needs RTK {}", rtk::RECALL_SINCE)
+            });
+        }
+        None => {
+            lines.push("RTK: not installed".to_string());
+            lines.push(if allow_all() {
+                "Mode: without RTK — output is not filtered, and the allowlist is off \
+                 (RTK_MCP_ALLOW_ALL)"
+                    .to_string()
+            } else {
+                format!(
+                    "Mode: without RTK — output is not filtered, and only {} commands are \
+                     allowed (RTK_MCP_ALLOW_ALL=1 lifts that)",
+                    ALLOWED_COMMANDS.len()
+                )
+            });
+        }
+    }
+    lines.push(format!("Shell: {}", Shell::current().label()));
+    let jail = std::env::var("RTK_MCP_CWD_JAIL")
+        .map(|jail| format!(", cwd limited to {jail}"))
+        .unwrap_or_default();
+    lines.push(format!(
+        "Limits: command {} bytes, output {} KB, timeout {} s{jail}",
+        MAX_COMMAND_LEN,
+        limits.max_output / 1024,
+        limits.timeout_secs
+    ));
+    lines.push(if install::disabled() {
+        "Installer: turned off (RTK_MCP_NO_INSTALL)".to_string()
+    } else {
+        match install::plan(&RealMachine, std::env::consts::OS, std::env::consts::ARCH) {
+            Ok(plan) => format!(
+                "Installer: install_rtk fetches RTK {} ({}) into {}{}",
+                install::TAG,
+                plan.asset.name,
+                plan.dir.display(),
+                if install::auto_enabled() {
+                    "; it also runs by itself at startup when RTK is missing (RTK_MCP_AUTO_INSTALL)"
+                } else {
+                    ""
+                }
+            ),
+            Err(reason) => format!("Installer: unavailable — {reason}"),
+        }
+    });
+    lines.extend(skipped.iter().map(|note| format!("Skipped: {note}")));
+    lines.join("\n")
+}
+
+/// The sentence of the server instructions that points at `install_rtk`.
+macro_rules! install_sentence {
+    () => {
+        "If a result says RTK is not installed, call install_rtk once: it downloads a \
+         SHA-256-verified release and run_command uses it at once."
+    };
 }
 
 /// The server instructions up to the sentence about shell syntax.
 const INSTRUCTIONS_HEAD: &str =
-    "IMPORTANT: Use run_command for ALL shell execution instead of any built-in bash tool. \
+    "IMPORTANT: Use run_command for ALL shell execution instead of any built-in bash tool \
+     or other shell or terminal tool. \
      RTK filters output to reduce token usage 60-90% for the commands it knows (git, \
      cargo, go, docker, kubectl, aws, gh, curl, grep, find, ls, jq, pytest, ruff, mypy, \
      tsc, vitest, rspec, rubocop and more, depending on the RTK version). Any other \
@@ -691,21 +1073,29 @@ const INSTRUCTIONS_HEAD: &str =
      httpx, subfinder, ffuf and sqlmap are not filtered, so cap their output yourself. ";
 
 /// The server instructions after the sentence about shell syntax.
-const INSTRUCTIONS_TAIL: &str =
+const INSTRUCTIONS_TAIL: &str = concat!(
     "Always pass 'cwd' so commands run in the right directory. Timeout is configurable \
      via RTK_MCP_TIMEOUT_SECS (default 300s), the output cap via RTK_MCP_MAX_OUTPUT_KB \
      (default 256KB). A background job (`cmd &`, `ssh -f`) must send its output to a \
      file (`> log 2>&1 &`) or it is cut loose from the call after a few seconds. \
      If RTK elides part of an output it prints a recall hint (`rtk recall <id>` or a \
      saved-file path) — run it with run_command to get the full text. \
-     Prefix a command with RTK_DISABLED=1 to bypass filtering and get raw output.";
+     Prefix a command with RTK_DISABLED=1 to bypass filtering and get raw output. ",
+    install_sentence!()
+);
 
 /// What the server tells the model when it connects; `shell` supplies the sentence about syntax.
+/// With installing turned off there is no `install_rtk` tool, so the sentence about it is left out.
 fn instructions(shell: &Shell) -> String {
-    format!(
+    let text = format!(
         "{INSTRUCTIONS_HEAD}{} {INSTRUCTIONS_TAIL}",
         shell.syntax_note()
-    )
+    );
+    if install::disabled() {
+        text.replace(concat!(" ", install_sentence!()), "")
+    } else {
+        text
+    }
 }
 
 struct CommandResult {
@@ -766,18 +1156,13 @@ fn interpret_rewrite(exit_code: Option<i32>, stdout: &str) -> Rewrite {
     }
 }
 
-/// Ask RTK for the token-optimized equivalent of a command string.
+/// Ask the RTK at `program` for the token-optimized equivalent of a command string.
 ///
 /// Uses `rtk rewrite` — the single source of truth for RTK's hook logic (command mapping and
 /// the user's deny rules). See [`interpret_rewrite`] for how the answer is read.
 ///
 /// `cwd` matters: RTK finds project-level Claude settings (`.claude/settings.json`, where deny
 /// rules can live) by walking up from its working directory.
-async fn get_rtk_rewrite(command: &str, cwd: Option<&Path>) -> Rewrite {
-    rewrite_via("rtk", command, cwd).await
-}
-
-/// [`get_rtk_rewrite`] with an explicit RTK binary (lets the tests use a stub).
 ///
 /// # Why stdout-only (not merged stdout+stderr)
 /// `run_with_timeout` merges stdout and stderr into a single string.  If `rtk rewrite`
@@ -791,7 +1176,7 @@ async fn get_rtk_rewrite(command: &str, cwd: Option<&Path>) -> Rewrite {
 ///
 /// A rewrite that cannot be obtained at all (spawn error, timeout) is `Passthrough`: the
 /// command runs unrewritten, as it always did when RTK has nothing to say about it.
-async fn rewrite_via(program: &str, command: &str, cwd: Option<&Path>) -> Rewrite {
+async fn rewrite_via(program: impl AsRef<OsStr>, command: &str, cwd: Option<&Path>) -> Rewrite {
     let mut cmd = Command::new(program);
     cmd.args(["rewrite", "--", command]);
     cmd.stdin(Stdio::null()); // isolate from MCP transport fd
@@ -833,20 +1218,22 @@ fn child_env(command: &mut Command) {
     {
         command.env("PYTHONIOENCODING", "utf-8");
     }
-    // Windows: an rtk.exe installed next to rtk-mcp.exe has to be found by the shell as well. The
-    // PATH to extend is the one the command already carries (a POSIX shell's tools directory is put
-    // there by `Shell::command`), else this process's own.
-    if let Some(dir) = shell::bundled_rtk_dir() {
+    // A rewritten command is the string `rtk git status`, which the shell resolves by name — so it
+    // has to find the RTK in use even when that one is not on the PATH the server was started
+    // with (Claude Desktop's is short; an RTK installed by `install_rtk` goes to ~/.local/bin; on
+    // Windows the installer puts rtk.exe next to rtk-mcp.exe). The PATH to extend is the one the
+    // command already carries (a POSIX shell's tools directory is put there by `Shell::command`),
+    // else this process's own.
+    if let Some(rtk) = rtk::current() {
         let current = command
             .as_std()
             .get_envs()
             .find(|(key, _)| key.to_str().is_some_and(|k| k.eq_ignore_ascii_case("PATH")))
-            .and_then(|(_, value)| value.map(std::ffi::OsStr::to_os_string))
+            .and_then(|(_, value)| value.map(OsStr::to_os_string))
             .or_else(|| std::env::var_os("PATH"));
-        command.env(
-            "PATH",
-            shell::path_with_dirs_first(current.as_deref(), &[dir]),
-        );
+        if let Some(path) = rtk::path_for_children(&rtk, current.as_deref(), &RealMachine) {
+            command.env("PATH", path);
+        }
     }
 }
 
@@ -875,13 +1262,14 @@ async fn run_in_shell(
 /// Execute a command directly (no shell expansion). Used for RTK probes and savings tools.
 /// Same handling as `run_shell_cmd`.
 async fn run_with_timeout(
-    cmd: &str,
+    cmd: impl AsRef<OsStr>,
     args: &[&str],
     cwd: Option<&Path>,
 ) -> Result<CommandResult, String> {
+    let cmd = cmd.as_ref();
     let mut command = Command::new(cmd);
     command.args(args);
-    exec(command, cwd, &format!("'{}'", cmd)).await
+    exec(command, cwd, &format!("'{}'", cmd.to_string_lossy())).await
 }
 
 /// Run `command` with this server's process hygiene and collect its output.
@@ -1163,41 +1551,6 @@ fn collect_output(stdout: &[u8], stderr: &[u8]) -> String {
     }
 }
 
-/// Validate RTK installation by checking --version and the rewrite subcommand.
-/// Stdin is explicitly set to null so these probes never touch the MCP transport fd.
-/// Returns the `rtk --version` line (e.g. "rtk 0.49.0") when RTK is usable.
-fn detect_rtk() -> Option<String> {
-    let mut version_probe = std::process::Command::new("rtk");
-    version_probe.arg("--version").stdin(Stdio::null());
-    hide_console(&mut version_probe);
-    let version_out = version_probe.output().ok()?;
-    let version = String::from_utf8_lossy(&version_out.stdout)
-        .trim()
-        .to_string();
-    if !(version.starts_with("rtk ") && version_out.status.success()) {
-        return None;
-    }
-
-    // Verify `rtk rewrite` works — that's the core routing mechanism this server relies on.
-    let mut probe = std::process::Command::new("rtk");
-    probe
-        .args(["rewrite", "--", "git status"])
-        .stdin(Stdio::null());
-    if std::env::var_os("RTK_SUPPRESS_HOOK_WARNING").is_none() {
-        probe.env("RTK_SUPPRESS_HOOK_WARNING", "1");
-    }
-    hide_console(&mut probe);
-    let output = probe.output().ok()?;
-    match interpret_rewrite(
-        output.status.code(),
-        &String::from_utf8_lossy(&output.stdout),
-    ) {
-        Rewrite::Passthrough => None,
-        // A deny rule for `git status` still proves that `rtk rewrite` itself works.
-        Rewrite::Rewritten(_) | Rewrite::Denied => Some(version),
-    }
-}
-
 fn main() -> anyhow::Result<()> {
     // Windows: this executable is also the launcher of cmd.exe commands (`shell::run_cmd_launcher`),
     // which has to run before anything of the server starts.
@@ -1239,7 +1592,26 @@ async fn serve() -> anyhow::Result<()> {
 
     tracing::info!("Starting RTK-MCP server v{}", env!("CARGO_PKG_VERSION"));
 
-    let service = RtkMcpServer::new().serve(stdio()).await.inspect_err(|e| {
+    let server = RtkMcpServer::new();
+
+    // Opt-in (RTK_MCP_AUTO_INSTALL=1): fetch RTK in the background when none was found, so a
+    // fresh install needs nothing more than the Claude Desktop config entry. Commands that arrive
+    // before it is done simply run unfiltered.
+    if install::auto_enabled() && rtk::current().is_none() {
+        tokio::spawn(async {
+            match install::run().await {
+                Ok(done) => tracing::info!(
+                    "installed {} at {} ({})",
+                    done.rtk.version,
+                    done.rtk.path.display(),
+                    done.asset
+                ),
+                Err(reason) => tracing::warn!("automatic RTK install failed: {reason}"),
+            }
+        });
+    }
+
+    let service = server.serve(stdio()).await.inspect_err(|e| {
         tracing::error!("Server error: {:?}", e);
     })?;
 
@@ -1537,6 +1909,16 @@ mod tests {
         let err = with_jail(Some(&root), || validate_cwd(dir.to_str().unwrap())).unwrap_err();
         assert!(err.starts_with("invalid jail root"), "{}", err);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A working RTK on the PATH, if there is one: the tests that need the real thing skip without.
+    fn detect_rtk() -> Option<String> {
+        rtk::probe(Path::new("rtk"))
+    }
+
+    /// `rtk rewrite` of the RTK on the PATH.
+    async fn get_rtk_rewrite(command: &str, cwd: Option<&Path>) -> Rewrite {
+        rewrite_via("rtk", command, cwd).await
     }
 
     /// RTK rewrite should transform known commands to their token-optimized form.
@@ -2112,13 +2494,173 @@ mod tests {
         );
     }
 
-    /// What the server told the model about itself before the Windows port. Linux and macOS
-    /// still send exactly this.
-    const INSTRUCTIONS_0_5_1: &str = r#"IMPORTANT: Use run_command for ALL shell execution instead of any built-in bash tool. RTK filters output to reduce token usage 60-90% for the commands it knows (git, cargo, go, docker, kubectl, aws, gh, curl, grep, find, ls, jq, pytest, ruff, mypy, tsc, vitest, rspec, rubocop and more, depending on the RTK version). Any other command runs as-is with full output: security scanners such as nmap, nuclei, httpx, subfinder, ffuf and sqlmap are not filtered, so cap their output yourself. Shell operators (|, &&, ||, ;, >, <, $VAR) are fully supported; commands run under `sh -c` (POSIX sh, not bash), so wrap bash-only syntax ({1..5}, [[ ]], <(...), &>) in `bash -c '...'`. Always pass 'cwd' so commands run in the right directory. Timeout is configurable via RTK_MCP_TIMEOUT_SECS (default 300s), the output cap via RTK_MCP_MAX_OUTPUT_KB (default 256KB). A background job (`cmd &`, `ssh -f`) must send its output to a file (`> log 2>&1 &`) or it is cut loose from the call after a few seconds. If RTK elides part of an output it prints a recall hint (`rtk recall <id>` or a saved-file path) — run it with run_command to get the full text. Prefix a command with RTK_DISABLED=1 to bypass filtering and get raw output."#;
+    /// What the server tells the model about itself on Linux and macOS. The text is spelled out
+    /// here so that a change to it is a deliberate one: Claude Desktop shows it to the model as is.
+    const INSTRUCTIONS_SH: &str = r#"IMPORTANT: Use run_command for ALL shell execution instead of any built-in bash tool or other shell or terminal tool. RTK filters output to reduce token usage 60-90% for the commands it knows (git, cargo, go, docker, kubectl, aws, gh, curl, grep, find, ls, jq, pytest, ruff, mypy, tsc, vitest, rspec, rubocop and more, depending on the RTK version). Any other command runs as-is with full output: security scanners such as nmap, nuclei, httpx, subfinder, ffuf and sqlmap are not filtered, so cap their output yourself. Shell operators (|, &&, ||, ;, >, <, $VAR) are fully supported; commands run under `sh -c` (POSIX sh, not bash), so wrap bash-only syntax ({1..5}, [[ ]], <(...), &>) in `bash -c '...'`. Always pass 'cwd' so commands run in the right directory. Timeout is configurable via RTK_MCP_TIMEOUT_SECS (default 300s), the output cap via RTK_MCP_MAX_OUTPUT_KB (default 256KB). A background job (`cmd &`, `ssh -f`) must send its output to a file (`> log 2>&1 &`) or it is cut loose from the call after a few seconds. If RTK elides part of an output it prints a recall hint (`rtk recall <id>` or a saved-file path) — run it with run_command to get the full text. Prefix a command with RTK_DISABLED=1 to bypass filtering and get raw output. If a result says RTK is not installed, call install_rtk once: it downloads a SHA-256-verified release and run_command uses it at once."#;
 
     #[test]
-    fn sh_instructions_are_what_0_5_1_sent() {
-        assert_eq!(instructions(&Shell::Sh), INSTRUCTIONS_0_5_1);
+    fn sh_instructions_are_what_0_7_0_sends() {
+        assert_eq!(instructions(&Shell::Sh), INSTRUCTIONS_SH);
+    }
+
+    #[test]
+    fn the_instructions_point_at_install_rtk_unless_installing_is_off() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        let before = std::env::var_os("RTK_MCP_NO_INSTALL");
+        std::env::remove_var("RTK_MCP_NO_INSTALL");
+        let with = instructions(&Shell::Sh);
+        std::env::set_var("RTK_MCP_NO_INSTALL", "1");
+        let without = instructions(&Shell::Sh);
+        match before {
+            Some(v) => std::env::set_var("RTK_MCP_NO_INSTALL", v),
+            None => std::env::remove_var("RTK_MCP_NO_INSTALL"),
+        }
+        assert!(with.contains("call install_rtk once"), "{with}");
+        assert!(!without.contains("install_rtk"), "{without}");
+        assert!(
+            with.starts_with(&without[..without.len() - 1]),
+            "only the sentence about install_rtk differs"
+        );
+        assert!(
+            without.ends_with("get raw output."),
+            "the text still ends cleanly: {without}"
+        );
+    }
+
+    #[test]
+    fn the_tool_surface_is_the_nine_documented_tools() {
+        let tools = RtkMcpServer::tool_router().list_all();
+        let mut names: Vec<String> = tools.iter().map(|t| t.name.to_string()).collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "get_rtk_config",
+                "get_rtk_discover",
+                "get_rtk_recall",
+                "get_rtk_rewrite",
+                "get_rtk_savings",
+                "get_rtk_session",
+                "get_rtk_status",
+                "install_rtk",
+                "run_command",
+            ]
+        );
+        for tool in &tools {
+            let read_only = tool.annotations.as_ref().and_then(|a| a.read_only_hint);
+            let name = tool.name.as_ref();
+            if name == "run_command" || name == "install_rtk" {
+                assert_ne!(read_only, Some(true), "{name} changes things");
+            } else {
+                assert_eq!(read_only, Some(true), "{name} only reads");
+            }
+            assert!(
+                tool.description.as_deref().is_some_and(|d| !d.is_empty()),
+                "{name} has a description"
+            );
+        }
+    }
+
+    #[test]
+    fn run_command_leads_with_the_instruction_to_use_it_for_all_shell_commands() {
+        let router = RtkMcpServer::tool_router();
+        let tool = router.get("run_command").expect("registered");
+        let description = tool.description.as_deref().unwrap();
+        assert!(
+            description.starts_with("Run a shell command through RTK"),
+            "{description}"
+        );
+        let lead = &description[..description.find("Uses `rtk rewrite`").unwrap()];
+        assert!(lead.contains("Use this for ALL shell commands"), "{lead}");
+        assert!(
+            lead.contains("instead of any other shell, terminal or command tool"),
+            "{lead}"
+        );
+    }
+
+    #[test]
+    fn recall_args_put_the_hash_last_and_after_double_dash() {
+        let request = |hash: Option<&str>, list: bool| GetRtkRecallRequest {
+            hash: hash.map(str::to_string),
+            list: Some(list),
+            full: Some(true),
+            from: Some(5),
+            lines: Some(20),
+            grep: Some("^error".to_string()),
+        };
+        assert_eq!(
+            recall_args(&request(Some("  ab12cd "), false)).unwrap(),
+            [
+                "recall",
+                "--full",
+                "--from=5",
+                "--lines=20",
+                "--grep=^error",
+                "--",
+                "ab12cd"
+            ]
+        );
+        // a value that looks like an option stays a value
+        let args = recall_args(&request(Some("--list"), false)).unwrap();
+        assert_eq!(args[args.len() - 2..], ["--", "--list"]);
+        // listing needs no hash, and ignores one
+        assert_eq!(
+            recall_args(&request(None, true)).unwrap(),
+            [
+                "recall",
+                "--list",
+                "--full",
+                "--from=5",
+                "--lines=20",
+                "--grep=^error"
+            ]
+        );
+        assert!(!recall_args(&request(Some("ab12"), true))
+            .unwrap()
+            .contains(&"ab12".to_string()));
+        // neither a hash nor list
+        assert!(recall_args(&request(None, false)).is_err());
+        assert!(recall_args(&request(Some("   "), false)).is_err());
+        let bare = GetRtkRecallRequest {
+            hash: Some("ab12".to_string()),
+            list: None,
+            full: None,
+            from: None,
+            lines: None,
+            grep: None,
+        };
+        assert_eq!(recall_args(&bare).unwrap(), ["recall", "--", "ab12"]);
+    }
+
+    #[test]
+    fn the_missing_rtk_note_comes_first_and_then_every_twentieth_time() {
+        let due: Vec<usize> = (0..61).filter(|&n| hint_due(n)).collect();
+        assert_eq!(due, [0, 20, 40, 60]);
+    }
+
+    #[test]
+    fn the_allowlist_is_off_with_rtk_unless_the_setting_says_otherwise() {
+        assert!(allow_all_from(None, true));
+        assert!(!allow_all_from(None, false));
+        assert!(allow_all_from(Some("1"), false));
+        assert!(allow_all_from(Some("TRUE"), false));
+        assert!(!allow_all_from(Some("0"), true));
+        assert!(!allow_all_from(Some("yes"), true), "only 1 and true count");
+    }
+
+    #[test]
+    fn an_old_rtk_gets_an_upgrade_note_and_a_current_one_does_not() {
+        let with = |version: &str| rtk::Rtk {
+            path: PathBuf::from("/x/rtk"),
+            version: version.to_string(),
+            origin: rtk::Origin::Path,
+        };
+        let pinned = format!("rtk {}", install::TAG.trim_start_matches('v'));
+        assert_eq!(upgrade_note(&with(&pinned)), "");
+        assert_eq!(upgrade_note(&with("rtk 99.0.0")), "");
+        assert_eq!(upgrade_note(&with("garbage")), "");
+        let note = upgrade_note(&with("rtk 0.34.3"));
+        assert!(note.contains("newer") && note.contains("/x/rtk"), "{note}");
     }
 
     #[test]

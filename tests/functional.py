@@ -32,6 +32,18 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 IS_WINDOWS = os.name == "nt"
+# The tests that download from GitHub (install_rtk, RTK_MCP_AUTO_INSTALL, the pinned checksums):
+# see network_enabled().
+NETWORK_SETTING = os.environ.get("RTK_MCP_TEST_NETWORK", "").lower()
+RTK_EXE = "rtk.exe" if IS_WINDOWS else "rtk"
+ALL_TOOLS = {
+    "run_command", "get_rtk_savings", "get_rtk_discover", "get_rtk_session",
+    "install_rtk", "get_rtk_status", "get_rtk_recall", "get_rtk_config", "get_rtk_rewrite",
+}
+READ_ONLY_TOOLS = (
+    "get_rtk_savings", "get_rtk_discover", "get_rtk_session",
+    "get_rtk_status", "get_rtk_recall", "get_rtk_config", "get_rtk_rewrite",
+)
 ARGS = [a for a in sys.argv[1:] if not a.startswith("--")]
 INSTALLED = "--installed" in sys.argv[1:]  # check an install.ps1 layout instead of running everything
 BINARY = os.path.abspath(ARGS[0] if ARGS else "target/release/rtk-mcp" + (".exe" if IS_WINDOWS else ""))
@@ -82,12 +94,17 @@ def same_dir(printed, expected):
 class Server:
     """One rtk-mcp process in an isolated HOME, speaking line-delimited JSON-RPC."""
 
-    def __init__(self, path=None, deny=(), extra_env=None, binary=None):
+    def __init__(self, path=None, deny=(), extra_env=None, binary=None, home_files=()):
         self.root = tempfile.mkdtemp(prefix="rtk-mcp-func-")
         self.home = os.path.join(self.root, "home")
         self.project = os.path.join(self.root, "project")
         os.makedirs(os.path.join(self.home, ".claude", "projects"))
         os.makedirs(os.path.join(self.project, ".claude"))
+        # files to put into HOME before the server starts: (source, path relative to HOME)
+        for source, relative in home_files:
+            target = os.path.join(self.home, relative)
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            shutil.copy2(source, target)
         # RTK reads deny rules from the user's and from the project's Claude settings. On Windows it
         # finds the user's through the profile folder, not through HOME, so the project's file (found
         # by walking up from the working directory) is the one a test controls there.
@@ -169,9 +186,9 @@ class Server:
                 return message
         raise TimeoutError("no response to %s" % method)
 
-    def call(self, name, **arguments):
+    def call(self, name, _timeout=60, **arguments):
         """tools/call -> (is_error, text); a protocol-level error comes back as (True, error)."""
-        response = self.request("tools/call", {"name": name, "arguments": arguments})
+        response = self.request("tools/call", {"name": name, "arguments": arguments}, timeout=_timeout)
         if "error" in response:
             return True, "protocol error: " + json.dumps(response["error"])
         result = response["result"]
@@ -264,12 +281,20 @@ def test_with_rtk(version):
         # --- handshake and tool surface -------------------------------------------------------
         check("initialize reports rtk-mcp", s.init["serverInfo"]["name"] == "rtk-mcp", s.init)
         check("initialize carries instructions", "run_command" in s.init.get("instructions", ""))
+        check("the instructions say to use run_command instead of other shell tools",
+              "instead of any built-in bash tool or other shell or terminal tool" in s.init.get("instructions", ""),
+              s.init.get("instructions", "")[:300])
+        check("the instructions point at install_rtk", "call install_rtk once" in s.init.get("instructions", ""),
+              s.init.get("instructions", "")[-300:])
         tools = s.tools()
-        check("tools/list has the 4 tools", set(tools) == {
-            "run_command", "get_rtk_savings", "get_rtk_discover", "get_rtk_session"}, sorted(tools))
+        check("tools/list has the 9 tools", set(tools) == ALL_TOOLS, sorted(tools))
         props = tools["run_command"]["inputSchema"]["properties"]
         check("run_command takes command + cwd", "command" in props and "cwd" in props, props)
         desc = tools["run_command"]["description"]
+        check("run_command's description leads with 'use this for ALL shell commands'",
+              desc.startswith("Run a shell command through RTK")
+              and "Use this for ALL shell commands" in desc[:250]
+              and "instead of any other shell, terminal or command tool" in desc[:350], desc[:350])
         check("run_command documents the configurable limits",
               "RTK_MCP_TIMEOUT_SECS (default 300s)" in desc and "RTK_MCP_MAX_OUTPUT_KB" in desc, desc[-400:])
         if IS_WINDOWS:
@@ -281,9 +306,13 @@ def test_with_rtk(version):
               tools["run_command"]["annotations"].get("destructiveHint") is True
               and tools["run_command"]["annotations"].get("openWorldHint") is True,
               tools["run_command"].get("annotations"))
-        check("stats tools are flagged read-only", all(
-            tools[n]["annotations"].get("readOnlyHint") is True
-            for n in ("get_rtk_savings", "get_rtk_discover", "get_rtk_session")))
+        check("stats, status, recall, config and rewrite tools are flagged read-only", all(
+            tools[n]["annotations"].get("readOnlyHint") is True for n in READ_ONLY_TOOLS))
+        install_annotations = tools["install_rtk"]["annotations"]
+        check("install_rtk is flagged non-destructive, idempotent and open-world",
+              install_annotations.get("destructiveHint") is False
+              and install_annotations.get("idempotentHint") is True
+              and install_annotations.get("openWorldHint") is True, install_annotations)
         check("startup log names the detected RTK", "detected" in s.log() and "rtk " in s.log(), s.log()[-300:])
 
         # --- running commands ---------------------------------------------------------------
@@ -370,6 +399,43 @@ def test_with_rtk(version):
         check("discover rejects csv", err and "unknown variant" in text, text)
         err, text = s.call("get_rtk_session")
         check("session answers", text.strip() != "", text)
+
+        # --- the tools added in 0.7.0 --------------------------------------------------------
+        err, text = s.call("get_rtk_status")
+        check("status names the RTK in use, where it is and how it was found",
+              not err and ("RTK: rtk %d.%d.%d at " % version) in text and "found on PATH" in text, text)
+        check("status describes the mode, the shell and the limits",
+              "every command goes through `rtk rewrite`" in text and "Shell: " in text
+              and "Limits: command 4096 bytes, output 256 KB, timeout 300 s" in text, text)
+        err, text = s.call("get_rtk_rewrite", command="git status")
+        check("rewrite preview shows the rewritten form", not err and text.startswith("Rewritten: ") and "rtk" in text, text)
+        err, text = s.call("get_rtk_rewrite", command="echo plain")
+        check("rewrite preview says when RTK has no filter", not err and text.startswith("No RTK filter"), text)
+        err, text = s.call("get_rtk_rewrite", command="git push origin main", cwd=s.project)
+        check("rewrite preview reports a deny rule", not err and text.startswith("Denied"), text)
+        marker = os.path.join(s.project, "preview-marker")
+        err, text = s.call("get_rtk_rewrite", command="touch " + sh_path(marker))
+        check("a rewrite preview never runs the command", text.startswith("Denied") and not os.path.exists(marker), text)
+        err, text = s.call("get_rtk_rewrite", command="  ")
+        check("rewrite preview rejects an empty command", err and "empty" in text.lower(), text)
+        err, text = s.call("get_rtk_rewrite", command="ls", cwd=os.path.join(s.project, "missing"))
+        check("rewrite preview checks the cwd like run_command does", err and "invalid cwd" in text, text)
+        err, text = s.call("get_rtk_config")
+        check("config shows RTK's configuration", not err and text.strip() != "", text)
+        if version >= (0, 49, 0):
+            err, text = s.call("get_rtk_recall", list=True)
+            check("recall list works on RTK >= 0.49", not err, text)
+            err, text = s.call("get_rtk_recall")
+            check("recall without a hash or list says what to pass", err and "hash" in text and "list=true" in text, text)
+            err, text = s.call("get_rtk_recall", hash="--full", grep="x")
+            check("a hash that looks like an option is not taken for one", s.alive() and "unexpected argument" not in text, text)
+        else:
+            err, text = s.call("get_rtk_recall", list=True)
+            check("recall on an RTK that predates it says so instead of running it",
+                  err and "predates `rtk recall`" in text and "0.49.0" in text, text)
+        err, text = s.call("install_rtk")
+        check("install_rtk with RTK present installs nothing and says where RTK is",
+              not err and "already installed" in text and ("rtk %d.%d.%d" % version) in text, text)
 
         check("server still alive and quiet", s.alive())
     finally:
@@ -549,10 +615,26 @@ def test_background_jobs():
         s.close()
 
 
+def usual_rtk_places():
+    """RTKs the server would find although the test gives it a PATH without one: outside the
+    throwaway HOME it also looks in Homebrew's and /usr/local's directories."""
+    if IS_WINDOWS:
+        return []
+    places = ("/opt/homebrew/bin", "/usr/local/bin", "/home/linuxbrew/.linuxbrew/bin")
+    return [d for d in places if os.path.isfile(os.path.join(d, "rtk"))]
+
+
+def tool_version():
+    """The RTK release tag install_rtk is pinned to, read from the source."""
+    source = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src", "install.rs")
+    with open(source, encoding="utf-8") as f:
+        return re.search(r'tag \{\s*\(\) => \{\s*"(v\d+\.\d+\.\d+)"', f.read().replace("\n", " ")).group(1)
+
+
 def test_without_rtk():
     # A PATH that cannot contain rtk: only the system dirs.
     path = BASIC_PATH
-    if rtk_version(path) is not None:
+    if rtk_version(path) is not None or usual_rtk_places():
         skip("no-RTK fallback", "rtk is installed in the system dirs")
         return
     s = Server(path=path)
@@ -560,6 +642,21 @@ def test_without_rtk():
         check("startup log warns RTK is missing", "RTK not found" in s.log(), s.log()[-300:])
         err, text = s.call("run_command", command="echo hello without rtk")
         check("echo works without RTK", not err and "hello without rtk" in text, text)
+        check("the first result says RTK is missing and names install_rtk",
+              "RTK is not installed" in text and "install_rtk" in text, text)
+        err, text = s.call("run_command", command="echo second")
+        check("the note is not repeated on the next command",
+              not err and "second" in text and "RTK is not installed" not in text, text)
+        check("install_rtk is offered", "install_rtk" in s.tools())
+        check("the instructions point at install_rtk", "call install_rtk once" in s.init["instructions"])
+        err, text = s.call("get_rtk_status")
+        check("status says RTK is missing and what the installer would fetch",
+              not err and "RTK: not installed" in text and "Mode: without RTK" in text
+              and ("Installer: install_rtk fetches RTK " + tool_version()) in text, text)
+        for tool, args in (("get_rtk_recall", {"list": True}), ("get_rtk_config", {}),
+                           ("get_rtk_rewrite", {"command": "git status"})):
+            err, text = s.call(tool, **args)
+            check(tool + " explains RTK is missing", not err and "RTK not installed" in text and "install_rtk" in text, text)
         err, text = s.call("run_command", command="perl -e 1")
         check("a command outside the allowlist is blocked", err and "allowlist" in text.lower(), text)
         err, text = s.call("run_command", command="bash -c 'echo from bash'")
@@ -582,6 +679,243 @@ def test_without_rtk():
         check("RTK_MCP_ALLOW_ALL=1 lifts the allowlist", not err and "allowed by env" in text, text)
     finally:
         s.close()
+
+    s = Server(path=path, extra_env={"RTK_MCP_NO_INSTALL": "1"})
+    try:
+        check("RTK_MCP_NO_INSTALL: there is no install_rtk tool", "install_rtk" not in s.tools(), sorted(s.tools()))
+        check("RTK_MCP_NO_INSTALL: the instructions do not mention it", "install_rtk" not in s.init["instructions"],
+              s.init["instructions"][-300:])
+        err, text = s.call("run_command", command="echo no installer")
+        check("RTK_MCP_NO_INSTALL: the note gives the manual command instead",
+              "RTK is not installed" in text and "install_rtk" not in text
+              and ("winget install rtk-ai.rtk" if IS_WINDOWS else "cargo install --git") in text, text)
+        err, text = s.call("get_rtk_savings")
+        check("RTK_MCP_NO_INSTALL: the stats tools do not mention it either",
+              not err and "RTK not installed" in text and "install_rtk" not in text, text)
+        err, text = s.call("get_rtk_status")
+        check("RTK_MCP_NO_INSTALL: status says the installer is off", "Installer: turned off" in text, text)
+    finally:
+        s.close()
+
+
+def test_rtk_locations():
+    """Where the server finds RTK, and that the commands it runs find it too.
+
+    A server started by a GUI application has a short PATH, so an RTK in ~/.local/bin, or named by
+    RTK_MCP_RTK_PATH, is not on it — and a rewritten command is the string `rtk ls`, which the shell
+    has to resolve by name.
+    """
+    real = shutil.which("rtk")
+    if not real:
+        skip("RTK locations", "rtk is not installed")
+        return
+    if usual_rtk_places():
+        skip("RTK locations", "rtk is installed in a directory the server always looks in")
+        return
+
+    def ls_works_through_rtk(s, label):
+        with open(os.path.join(s.project, "alpha.txt"), "w") as f:
+            f.write("alpha")
+        err, text = s.call("get_rtk_rewrite", command="ls")
+        check(label + ": `ls` is rewritten to an rtk command", not err and text.startswith("Rewritten: rtk"), text)
+        err, text = s.call("run_command", command="ls", cwd=s.project)
+        check(label + ": the rewritten command runs, the shell finds rtk",
+              not err and "alpha.txt" in text and "not found" not in text.lower(), text)
+        err, text = s.call("run_command", command="rtk --version")
+        check(label + ": `rtk` can be called by name from a command", not err and text.startswith("rtk "), text)
+        err, text = s.call("get_rtk_savings", format="json")
+        check(label + ": the stats tools use it too", not err and '"summary"' in text, text)
+
+    # --- in ~/.local/bin, not on PATH ---------------------------------------------------------------
+    s = Server(path=BASIC_PATH, home_files=[(real, os.path.join(".local", "bin", RTK_EXE))])
+    try:
+        err, text = s.call("get_rtk_status")
+        check("an RTK in ~/.local/bin is found although PATH lacks it",
+              not err and "found in a usual install directory" in text and ".local" in text, text)
+        check("the startup log says where it was found",
+              "detected at" in s.log() and "usual install directory" in s.log(), s.log()[-300:])
+        ls_works_through_rtk(s, "~/.local/bin")
+    finally:
+        s.close()
+
+    # --- named by RTK_MCP_RTK_PATH ------------------------------------------------------------------
+    custom = tempfile.mkdtemp(prefix="rtk-mcp-custom-")
+    try:
+        copy = os.path.join(custom, RTK_EXE)
+        shutil.copy2(real, copy)
+        s = Server(path=BASIC_PATH, extra_env={"RTK_MCP_RTK_PATH": copy})
+        try:
+            err, text = s.call("get_rtk_status")
+            check("RTK_MCP_RTK_PATH names the RTK to use",
+                  not err and "set by RTK_MCP_RTK_PATH" in text and custom in text, text)
+            ls_works_through_rtk(s, "RTK_MCP_RTK_PATH")
+        finally:
+            s.close()
+
+        # a setting that names nothing is reported, and the search goes on to PATH
+        missing = os.path.join(custom, "missing", RTK_EXE)
+        s = Server(extra_env={"RTK_MCP_RTK_PATH": missing})
+        try:
+            err, text = s.call("get_rtk_status")
+            check("a wrong RTK_MCP_RTK_PATH is reported and the search goes on",
+                  not err and "RTK: rtk " in text and "found on PATH" in text
+                  and "Skipped: RTK_MCP_RTK_PATH=" in text, text)
+            check("the startup log warns about it", "RTK_MCP_RTK_PATH=" in s.log(), s.log()[-300:])
+        finally:
+            s.close()
+    finally:
+        shutil.rmtree(custom, ignore_errors=True)
+
+    # --- RTK appears after the server has started ------------------------------------------------
+    s = Server(path=BASIC_PATH)
+    try:
+        err, text = s.call("get_rtk_status")
+        check("before RTK exists, the status says so", not err and "RTK: not installed" in text, text)
+        target = os.path.join(s.home, ".local", "bin", RTK_EXE)
+        os.makedirs(os.path.dirname(target))
+        shutil.copy2(real, target)
+        err, text = s.call("install_rtk")
+        check("install_rtk finds an RTK that was put there by hand, and installs nothing",
+              not err and "already installed" in text and "usual install directory" in text, text)
+        ls_works_through_rtk(s, "added while running")
+    finally:
+        s.close()
+
+    # --- a program called rtk that is not RTK comes first on PATH -------------------------------------
+    if not IS_WINDOWS:
+        shadow = tempfile.mkdtemp(prefix="rtk-mcp-shadow-")
+        try:
+            fake = os.path.join(shadow, "rtk")
+            with open(fake, "w") as f:
+                f.write("#!/bin/sh\necho 'another tool 9.9'\n")
+            os.chmod(fake, 0o755)
+            s = Server(path=shadow + os.pathsep + os.environ.get("PATH", "/usr/bin:/bin"))
+            try:
+                err, text = s.call("get_rtk_status")
+                check("a different program named rtk is skipped, the real RTK is used",
+                      not err and "RTK: rtk " in text and "is not a working RTK" in text, text)
+                ls_works_through_rtk(s, "shadowed")
+            finally:
+                s.close()
+        finally:
+            shutil.rmtree(shadow, ignore_errors=True)
+
+
+def network_enabled(version):
+    """Do the tests that download from GitHub run?
+
+    RTK_MCP_TEST_NETWORK=1 asks for them and =0 rules them out. Left unset they run on GitHub
+    Actions in the jobs whose RTK is the release install_rtk pins, which gives every system one real
+    install (and the 0.34 and 0.49 jobs have nothing to add).
+    """
+    if NETWORK_SETTING in ("1", "true"):
+        return True
+    if NETWORK_SETTING in ("0", "false"):
+        return False
+    pinned = tuple(int(n) for n in tool_version().lstrip("v").split("."))
+    return os.environ.get("GITHUB_ACTIONS") == "true" and version == pinned
+
+
+def test_pinned_checksums():
+    """The hashes install_rtk trusts are compiled into the server, so they have to be the ones RTK
+    published for the release it installs, as published now (a re-uploaded asset changes them)."""
+    tag = tool_version()
+    curl = shutil.which("curl")
+    if not curl:
+        skip("pinned checksums against GitHub", "curl is not installed")
+        return
+    here = os.path.dirname(os.path.abspath(__file__))
+    with open(os.path.join(here, "..", "data", "rtk-checksums-%s.txt" % tag), "rb") as f:
+        pinned = f.read().replace(b"\r\n", b"\n")
+    url = "https://github.com/rtk-ai/rtk/releases/download/%s/checksums.txt" % tag
+    got = subprocess.run([curl, "-fsSL", "--max-time", "60", url], capture_output=True, timeout=90)
+    published = got.stdout.replace(b"\r\n", b"\n")
+    check("data/rtk-checksums-%s.txt is the checksums.txt RTK published" % tag,
+          got.returncode == 0 and published == pinned,
+          "curl exit %s; %d bytes published, %d pinned" % (got.returncode, len(published), len(pinned)))
+
+
+def test_install_network(version):
+    """The real thing: download RTK from GitHub, check it against the hash pinned in the server,
+    put it in a throwaway directory, and run commands through it."""
+    if not network_enabled(version):
+        skip("install_rtk against GitHub", "set RTK_MCP_TEST_NETWORK=1 to download RTK")
+        return
+    test_pinned_checksums()
+    if rtk_version(BASIC_PATH) is not None or usual_rtk_places():
+        skip("install_rtk against GitHub", "rtk is installed in a directory the server always looks in")
+        return
+    tag = tool_version()
+    number = tag.lstrip("v")
+    root = tempfile.mkdtemp(prefix="rtk-mcp-install-")
+    bindir = os.path.join(root, "bin")
+    exe = os.path.join(bindir, RTK_EXE)
+    s = Server(path=BASIC_PATH, extra_env={"RTK_MCP_INSTALL_DIR": bindir})
+    try:
+        started = time.time()
+        err, text = s.call("install_rtk", _timeout=240)
+        print("      (install took %.1fs)" % (time.time() - started))
+        check("install_rtk installs the pinned release",
+              not err and text.startswith("Installed rtk %s at " % number) and "pinned in rtk-mcp" in text, text)
+        check("the executable is in the install directory", os.path.isfile(exe), os.listdir(root))
+        leftovers = [n for n in os.listdir(bindir) if n != RTK_EXE]
+        check("nothing else was written there (no licence files, no temporary file)", leftovers == [], leftovers)
+        if not IS_WINDOWS:
+            check("it is executable", os.access(exe, os.X_OK))
+        out = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=30).stdout
+        check("the file is a working RTK of the pinned version", out.strip() == "rtk " + number, out)
+
+        err, text = s.call("get_rtk_status")
+        check("status shows the installed RTK", not err and ("RTK: rtk %s at %s" % (number, exe)) in text, text)
+        with open(os.path.join(s.project, "alpha.txt"), "w") as f:
+            f.write("alpha")
+        err, text = s.call("run_command", command="ls", cwd=s.project)
+        check("commands run through the installed RTK without a restart",
+              not err and "alpha.txt" in text and "not found" not in text.lower(), text)
+        err, text = s.call("run_command", command="rtk --version")
+        check("`rtk` resolves by name for the commands it runs (its directory is not on PATH)",
+              not err and text.strip() == "rtk " + number, text)
+        err, text = s.call("get_rtk_savings", format="json")
+        check("the stats tools use the installed RTK", not err and '"summary"' in text, text)
+        err, text = s.call("install_rtk")
+        check("a second install_rtk finds it already installed", not err and "already installed" in text, text)
+        err, text = s.call("run_command", command="echo after install")
+        check("no 'RTK is not installed' note once RTK is there",
+              not err and "after install" in text and "RTK is not installed" not in text, text)
+    finally:
+        s.close()
+
+    # a server started later finds it again, in the install directory
+    s = Server(path=BASIC_PATH, extra_env={"RTK_MCP_INSTALL_DIR": bindir})
+    try:
+        err, text = s.call("get_rtk_status")
+        check("a later server finds the installed RTK in the install directory",
+              not err and "found in a usual install directory" in text and exe in text, text)
+    finally:
+        s.close()
+        shutil.rmtree(root, ignore_errors=True)
+
+    # RTK_MCP_AUTO_INSTALL: installed in the background at startup, the Apache-2.0 build on request
+    root = tempfile.mkdtemp(prefix="rtk-mcp-auto-")
+    bindir = os.path.join(root, "bin")
+    exe = os.path.join(bindir, RTK_EXE)
+    s = Server(path=BASIC_PATH, extra_env={
+        "RTK_MCP_INSTALL_DIR": bindir, "RTK_MCP_AUTO_INSTALL": "1", "RTK_MCP_RTK_EDITION": "oss"})
+    try:
+        text = ""
+        deadline = time.time() + 180
+        while time.time() < deadline:
+            err, text = s.call("get_rtk_status")
+            if "RTK: rtk " in text:
+                break
+            time.sleep(2)
+        check("RTK_MCP_AUTO_INSTALL installs RTK in the background", "RTK: rtk %s at " % number in text and os.path.isfile(exe), text)
+        check("the log says so", "installed rtk %s" % number in s.log(), s.log()[-400:])
+        err, text = s.call("run_command", command="rtk --version")
+        check("the oss build (RTK_MCP_RTK_EDITION=oss) runs commands too", not err and text.startswith("rtk "), text)
+    finally:
+        s.close()
+        shutil.rmtree(root, ignore_errors=True)
 
 
 def windows_default_shell():
@@ -745,7 +1079,10 @@ def test_windows(version, bash_path):
             check("no Git: cmd.exe is the fallback", "/d /s /c" in s.log().lower(), s.log()[-300:])
             check("no RTK: the startup log says so", "RTK not found" in s.log(), s.log()[-300:])
             err, text = s.call("run_command", command="echo %RTK_FUNC_TOKEN%")
-            check("no Git, no RTK: echo works", not err and text.strip() == "pipe-ok", text)
+            # without RTK the first result ends with the note about install_rtk
+            check("no Git, no RTK: echo works", not err and text.strip().startswith("pipe-ok"), text)
+            check("no Git, no RTK: the first result says RTK is missing and names install_rtk",
+                  "RTK is not installed" in text and "install_rtk" in text, text)
             err, text = s.call("run_command", command="dir /b", cwd=s.project)
             check("no RTK: dir is allowed on Windows", not err and ".claude" in text, text)
             err, text = s.call("run_command", command="where cmd")
@@ -865,6 +1202,8 @@ def main():
         test_cwd_jail(bool(version))
         test_background_jobs()
         test_without_rtk()
+        test_rtk_locations()
+        test_install_network(version)
     if IS_WINDOWS:
         test_windows(version, bash_path)
     print()

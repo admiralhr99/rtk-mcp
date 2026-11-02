@@ -509,26 +509,6 @@ fn posix_command(shell: &Path, line: &str, tools: &[PathBuf], path: Option<&OsSt
     command
 }
 
-/// The directory of `rtk.exe` when it sits next to `rtk-mcp.exe`, which is how the Windows
-/// installer lays them out. A Windows process looks in its own directory first, so the probes find
-/// it; the shell only searches PATH, so the children get this directory put on theirs.
-pub fn bundled_rtk_dir() -> Option<PathBuf> {
-    #[cfg(windows)]
-    {
-        bundled_rtk_dir_of(&std::env::current_exe().ok()?)
-    }
-    #[cfg(not(windows))]
-    {
-        None
-    }
-}
-
-/// The directory of `exe`, if an `rtk.exe` sits in it.
-fn bundled_rtk_dir_of(exe: &Path) -> Option<PathBuf> {
-    let dir = exe.parent()?;
-    dir.join("rtk.exe").is_file().then(|| dir.to_path_buf())
-}
-
 /// The program a command line starts with, as written, for the allowlist.
 ///
 /// On Linux and macOS that is the first word under POSIX quoting rules. On Windows the first word
@@ -1159,18 +1139,6 @@ mod tests {
             let base = base_command(&program(line).unwrap(), true);
             assert_eq!(base, "hostname", "{line}");
         }
-    }
-
-    #[test]
-    fn rtk_beside_the_server_is_found() {
-        let dir = std::env::temp_dir().join(format!("rtk-mcp-bundled-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let server = dir.join("rtk-mcp.exe");
-        assert_eq!(bundled_rtk_dir_of(&server), None);
-        std::fs::write(dir.join("rtk.exe"), b"").unwrap();
-        assert_eq!(bundled_rtk_dir_of(&server), Some(dir.clone()));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
