@@ -247,6 +247,14 @@ Having the server installed is not enough on its own: the model has to choose `r
 
 What this cannot do: no server can make a client pick its tool. A description is a strong hint, not a rule, and it only helps once the model has seen it: a model that has another shell tool loaded and knows `run_command` only by name will use the tool it has. When other tools can run commands too (a built-in terminal tool, Desktop Commander, another shell server) the model chooses among them, and in some conversations it will choose another. If you need it to be certain, remove the competing shell tools, or put one line in your own instructions ("Use run_command for shell commands"). If your client defers tools, say so in that line: "Use run_command for shell commands; if only its name is listed, load it first." Do not leave an instruction there that names another shell tool as the default or the only one: the model follows it. Claude Code can do better without relying on the model's choice: RTK's own hook (`rtk init -g`) filters its Bash tool directly.
 
+If your client defers MCP tools (the Claude desktop app's remote devices do), this is the line that worked when added to the personal preferences there:
+
+```text
+Shell commands on my computer: use rtk-mcp's run_command. If only its name is listed, load it first with tool search.
+```
+
+Tested through the Claude desktop app's remote devices (Linux, 0.8.1) with two test messages that ask for three shell commands on the computer. Before the line was added, the model ran them with Desktop Commander. With the line (plus a last sentence naming Desktop Commander as the fallback) it loaded `run_command` with tool search and ran them through it; RTK's history shows the filtered `df` and `ps` runs.
+
 ## Tools
 
 | Tool | Description |
