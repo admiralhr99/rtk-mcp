@@ -2622,7 +2622,12 @@ mod tests {
                     "{wire}"
                 );
             } else {
-                assert_eq!(wire.get("_meta"), None, "{} stays deferrable: {wire}", tool.name);
+                assert_eq!(
+                    wire.get("_meta"),
+                    None,
+                    "{} stays deferrable: {wire}",
+                    tool.name
+                );
             }
         }
     }
