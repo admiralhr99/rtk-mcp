@@ -15,7 +15,7 @@ use tokio::time::{timeout, Duration};
 
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{Implementation, ServerCapabilities, ServerConfig},
+    model::{Implementation, MetaObject, ServerCapabilities, ServerConfig},
     schemars,
     service::RequestContext,
     tool, tool_handler, tool_router,
@@ -551,6 +551,23 @@ fn recall_args(req: &GetRtkRecallRequest) -> Result<Vec<String>, String> {
     Ok(args)
 }
 
+/// The key Claude Code reads in a tool's `_meta` to load that tool at the start of a conversation
+/// instead of leaving it behind its tool search (documented at code.claude.com/docs/en/mcp,
+/// "Scale with MCP tool search"). Without it, a client that defers MCP tools shows the model only
+/// the name `run_command` until it goes looking, so the description that asks for the tool cannot
+/// compete with a shell tool the model already has loaded. Clients that do not know the key
+/// ignore it.
+const ALWAYS_LOAD_KEY: &str = "anthropic/alwaysLoad";
+
+/// The `_meta` of `run_command`, the one tool that has to be seen to be chosen. The other tools
+/// stay deferrable: they are looked up by name when wanted, and every tool loaded upfront costs
+/// context in every conversation.
+fn always_load() -> MetaObject {
+    let mut meta = serde_json::Map::new();
+    meta.insert(ALWAYS_LOAD_KEY.to_owned(), serde_json::Value::Bool(true));
+    MetaObject(meta)
+}
+
 #[tool_router]
 impl RtkMcpServer {
     #[tool(
@@ -583,7 +600,8 @@ impl RtkMcpServer {
             destructive_hint = true,
             idempotent_hint = false,
             open_world_hint = true
-        )
+        ),
+        meta = always_load()
     )]
     async fn run_command(
         &self,
@@ -2586,6 +2604,27 @@ mod tests {
             lead.contains("instead of any other shell, terminal or command tool"),
             "{lead}"
         );
+    }
+
+    #[test]
+    fn only_run_command_asks_to_be_loaded_up_front() {
+        // On the wire, where a client reads it, and through the same router the server runs with
+        let mut router = RtkMcpServer::tool_router();
+        describe_shell(&mut router, Shell::current());
+        let tools = router.list_all();
+        assert_eq!(tools.len(), 9);
+        for tool in &tools {
+            let wire = serde_json::to_value(tool).unwrap();
+            if tool.name == "run_command" {
+                assert_eq!(
+                    wire.pointer("/_meta/anthropic~1alwaysLoad"),
+                    Some(&serde_json::Value::Bool(true)),
+                    "{wire}"
+                );
+            } else {
+                assert_eq!(wire.get("_meta"), None, "{} stays deferrable: {wire}", tool.name);
+            }
+        }
     }
 
     #[test]

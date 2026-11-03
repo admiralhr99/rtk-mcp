@@ -2,7 +2,7 @@
 
 MCP server bridge for [RTK (Rust Token Killer)](https://github.com/rtk-ai/rtk) — token-optimized CLI output for any MCP-compatible client. Runs on Linux, macOS and Windows.
 
-It installs RTK itself when RTK is missing and upgrades an older RTK to the latest release (the `install_rtk` tool, [details](#rtk-itself)), and it asks the model to use RTK for shell commands, so there is nothing to put in your own preferences or system prompt. How far the last part goes depends on the client, see [Getting the model to use it](#getting-the-model-to-use-it).
+It installs RTK itself when RTK is missing and upgrades an older RTK to the latest release (the `install_rtk` tool, [details](#rtk-itself)), and it asks the model to use RTK for shell commands. Whether the model does depends on the client and on what else it can run commands with, see [Getting the model to use it](#getting-the-model-to-use-it).
 
 ## Measured
 
@@ -20,7 +20,7 @@ The filtering is RTK's work; rtk-mcp is the bridge that lets MCP clients such as
 
 To reproduce, compare `<command> | wc -c` with `rtk <command> | wc -c`. Numbers vary with the repo, the machine and the RTK version.
 
-What it costs: the tool descriptions and the server instructions are read once per conversation. For the nine tools of 0.8.0 that is 10.5 KB (about 2,600 tokens at 4 bytes per token); 0.7.0 had the same nine tools in 10.2 KB, and the four tools of 0.6.0 were 7.0 KB. The `git diff` above saves 121 KB, so one large output pays that back, but a conversation that only runs short commands costs more than it saves.
+What it costs: the tool descriptions and the server instructions are read once per conversation. For the nine tools of 0.8.1 (0.8.0 is the same) that is 10.5 KB (about 2,600 tokens at 4 bytes per token); 0.7.0 had the same nine tools in 10.2 KB, and the four tools of 0.6.0 were 7.0 KB. The `git diff` above saves 121 KB, so one large output pays that back, but a conversation that only runs short commands costs more than it saves. A client that defers MCP tools behind a tool search reads only the tool names until the model looks a tool up; since 0.8.1 `run_command` is the exception (about 1.6 KB of description, plus its schema), see [Getting the model to use it](#getting-the-model-to-use-it).
 
 Platforms: Linux, macOS and Windows, with prebuilt binaries for each. What is tested where is under [Platforms](#platforms).
 
@@ -238,13 +238,14 @@ Add to your MCP settings (check each client's documentation for the exact config
 
 ## Getting the model to use it
 
-Having the server installed is not enough on its own: the model has to choose `run_command` over whatever else it can run commands with. rtk-mcp does what a server can do about that, so you do not have to write it into your own preferences or system prompt:
+Having the server installed is not enough on its own: the model has to choose `run_command` over whatever else it can run commands with. rtk-mcp does what a server can do about that:
 
-- **The `run_command` description opens with the instruction**: "Run a shell command through RTK, which cuts the tokens in its output by 60-90%. Use this for ALL shell commands (git, ls, cat, grep, find, cargo, npm, docker, curl, tests, scripts) instead of any other shell, terminal or command tool." Every client shows tool descriptions to the model, so this is the part that works everywhere.
-- **The server instructions say it again.** rtk-mcp also sends the rule in the `instructions` field of the MCP handshake. A client that puts that field into the system prompt (Claude Code does) gives the model the rule before the first message. Claude Desktop is reported not to pass the field on ([anthropics/claude-code#43749](https://github.com/anthropics/claude-code/issues/43749), one user's reading of the app, not confirmed by Anthropic), which is why the description carries the rule too.
+- **The `run_command` description opens with the instruction**: "Run a shell command through RTK, which cuts the tokens in its output by 60-90%. Use this for ALL shell commands (git, ls, cat, grep, find, cargo, npm, docker, curl, tests, scripts) instead of any other shell, terminal or command tool." A client that loads the tool's definition shows the model this text. A client that defers MCP tools behind a tool search shows only the name `run_command` until the model looks the tool up, which is why the next point exists.
+- **`run_command` asks to be loaded upfront.** Since 0.8.1 the tool carries `"_meta": {"anthropic/alwaysLoad": true}`, the hint Claude Code documents for this ([Scale with MCP tool search](https://code.claude.com/docs/en/mcp#scale-with-mcp-tool-search)): the definition is in the model's context from the first message, so the model does not have to find the tool first. Clients that do not know the key ignore it. Only `run_command` has it; the other eight tools stay deferrable, because every tool loaded upfront costs context in every conversation.
+- **The server instructions say it again.** rtk-mcp also sends the rule in the `instructions` field of the MCP handshake. A client that puts that field into the system prompt (Claude Code does) gives the model the rule before the first message. Claude Desktop is reported not to pass the field on ([anthropics/claude-code#43749](https://github.com/anthropics/claude-code/issues/43749), one user's reading of the app, not confirmed by Anthropic), and a session that reached rtk-mcp through a bridge to a computer (the Claude desktop app's remote devices) showed the model no rtk-mcp instructions either. That is why the description carries the rule too.
 - **A missing RTK is announced where the model will see it**: the first `run_command` result without RTK, and every 20th after it, ends with a note that names `install_rtk`.
 
-What this cannot do: no server can make a client pick its tool. A description is a strong hint, not a rule. When other tools can run commands too (a built-in terminal tool, Desktop Commander, another shell server) the model chooses among them, and in some conversations it will choose another. If you need it to be certain, remove the competing shell tools, or put one line in your own instructions ("Use run_command for shell commands"). Claude Code can do better without relying on the model's choice: RTK's own hook (`rtk init -g`) filters its Bash tool directly.
+What this cannot do: no server can make a client pick its tool. A description is a strong hint, not a rule, and it only helps once the model has seen it: a model that has another shell tool loaded and knows `run_command` only by name will use the tool it has. When other tools can run commands too (a built-in terminal tool, Desktop Commander, another shell server) the model chooses among them, and in some conversations it will choose another. If you need it to be certain, remove the competing shell tools, or put one line in your own instructions ("Use run_command for shell commands"). Do not leave an instruction there that names another shell tool as the default or the only one: the model follows it. Claude Code can do better without relying on the model's choice: RTK's own hook (`rtk init -g`) filters its Bash tool directly.
 
 ## Tools
 
