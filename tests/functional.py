@@ -321,6 +321,12 @@ def test_with_rtk(version):
               tools["run_command"]["annotations"].get("destructiveHint") is True
               and tools["run_command"]["annotations"].get("openWorldHint") is True,
               tools["run_command"].get("annotations"))
+        check("run_command asks a deferring client to load it upfront (anthropic/alwaysLoad)",
+              tools["run_command"].get("_meta", {}).get("anthropic/alwaysLoad") is True,
+              tools["run_command"].get("_meta"))
+        check("no other tool does",
+              [name for name, tool in tools.items() if name != "run_command" and "_meta" in tool] == [],
+              {name: tool.get("_meta") for name, tool in tools.items() if "_meta" in tool})
         check("stats, status, recall, config and rewrite tools are flagged read-only", all(
             tools[n]["annotations"].get("readOnlyHint") is True for n in READ_ONLY_TOOLS))
         install_annotations = tools["install_rtk"]["annotations"]
