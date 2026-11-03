@@ -738,48 +738,32 @@ impl RtkMcpServer {
 
     #[tool(
         name = "install_rtk",
-        description = "Install RTK, the output filter run_command is built around, when it is \
-            missing: downloads the release pinned in this server from GitHub, checks its SHA-256 \
-            and starts using it at once (no restart). Does nothing if RTK is already installed. \
-            Call it when a run_command result says RTK is not installed.",
+        description = "Install RTK, the output filter run_command is built around, or upgrade the \
+            installed one to the latest release: finds the latest release on GitHub, downloads \
+            it, checks its SHA-256 and starts using it at once (no restart). An RTK that is up \
+            to date is left alone; one that cannot be replaced in place (a package manager's \
+            symlink, a read-only directory) is reported and not touched. Call it when a \
+            run_command result says RTK is not installed, or when asked to update RTK.",
         annotations(
-            title = "Install RTK",
+            title = "Install or upgrade RTK",
             read_only_hint = false,
-            destructive_hint = false,
+            destructive_hint = true,
             idempotent_hint = true,
             open_world_hint = true
         )
     )]
     async fn install_rtk(&self) -> Result<String, String> {
-        // RTK may have appeared since the server started (the user installed it by hand).
+        // RTK may have appeared, or been replaced, since the server started.
         rescan().await;
-        if let Some(rtk) = rtk::current() {
-            return Ok(format!(
-                "RTK is already installed: {} at {} ({}). Nothing to install.{}",
-                rtk.version,
-                rtk.path.display(),
-                rtk.origin.describe(),
-                upgrade_note(&rtk)
-            ));
-        }
-        let done = install::run().await?;
-        Ok(format!(
-            "Installed {} at {} (from {}; its SHA-256, {}, is the one pinned in rtk-mcp). \
-             run_command routes through it from now on — no restart needed. The directory was not \
-             added to your shell's PATH. With RTK present, commands are checked by RTK's own \
-             rewrite and the deny rules in your Claude settings instead of the built-in allowlist.",
-            done.rtk.version,
-            done.rtk.path.display(),
-            done.asset,
-            done.sha256
-        ))
+        install::run().await?.report()
     }
 
     #[tool(
         name = "get_rtk_status",
         description = "Show which RTK this server uses (path, version, how it was found), the \
             mode it runs in, its limits and what the installed RTK version supports. Also looks \
-            again for an RTK installed since the server started.",
+            again for an RTK installed since the server started, and says when the RTK in use is \
+            out of date.",
         annotations(title = "RTK status", read_only_hint = true, open_world_hint = false)
     )]
     async fn get_rtk_status(&self) -> Result<String, String> {
@@ -966,17 +950,59 @@ fn hint_due(commands_so_far: usize) -> bool {
     commands_so_far.is_multiple_of(HINT_EVERY)
 }
 
-/// When an RTK that is in use is older than the one this server installs.
-fn upgrade_note(rtk: &rtk::Rtk) -> String {
-    let pinned = rtk::parse_version(&format!("rtk {}", install::TAG.trim_start_matches('v')));
-    match (rtk::parse_version(&rtk.version), pinned) {
-        (Some(have), Some(pinned)) if have < pinned => format!(
-            " This server installs RTK {pinned}, which is newer: update RTK the way you \
-             installed it, or delete {} and call install_rtk again.",
-            rtk.path.display()
-        ),
-        _ => String::new(),
+/// When the RTK in use is older than the release this build carries the hashes of, a newer RTK
+/// exists and `install_rtk` can fetch it. (Without asking GitHub, that is all that is known.)
+fn outdated_note(rtk: &rtk::Rtk) -> Option<String> {
+    let newer = install::Release::pinned().version;
+    let have = rtk::parse_version(&rtk.version)?;
+    (have < newer).then(|| {
+        if install::disabled() {
+            format!("Update: RTK {have} is older than {newer}; update it the way you installed it")
+        } else {
+            format!("Update: RTK {have} is older than {newer}; call install_rtk to upgrade it")
+        }
+    })
+}
+
+/// The `Installer:` line of the status report.
+fn installer_line() -> String {
+    if install::disabled() {
+        return "Installer: turned off (RTK_MCP_NO_INSTALL)".to_string();
     }
+    let channel = match install::Channel::current() {
+        Ok(channel) => channel,
+        Err(reason) => return format!("Installer: unavailable — {reason}"),
+    };
+    let plan = match install::plan(&RealMachine, std::env::consts::OS, std::env::consts::ARCH) {
+        Ok(plan) => plan,
+        Err(reason) => return format!("Installer: unavailable — {reason}"),
+    };
+    let what = match channel {
+        install::Channel::Latest => format!(
+            "the latest RTK release ({}; {} if GitHub cannot be asked)",
+            plan.asset.name,
+            install::TAG
+        ),
+        install::Channel::Pinned => format!(
+            "RTK {} ({}, RTK_MCP_RTK_VERSION=pinned)",
+            install::TAG,
+            plan.asset.name
+        ),
+    };
+    let dir = plan
+        .target
+        .parent()
+        .map(|dir| dir.display().to_string())
+        .unwrap_or_default();
+    format!(
+        "Installer: install_rtk installs {what} into {dir} when RTK is missing, and upgrades an \
+         older RTK in place{}",
+        if install::auto_enabled() {
+            "; it also runs by itself at startup (RTK_MCP_AUTO_INSTALL)"
+        } else {
+            ""
+        }
+    )
 }
 
 /// What `get_rtk_status` answers.
@@ -1006,6 +1032,7 @@ fn status_report(skipped: &[String]) -> String {
             } else {
                 format!("Recall (get_rtk_recall): needs RTK {}", rtk::RECALL_SINCE)
             });
+            lines.extend(outdated_note(&rtk));
         }
         None => {
             lines.push("RTK: not installed".to_string());
@@ -1032,24 +1059,7 @@ fn status_report(skipped: &[String]) -> String {
         limits.max_output / 1024,
         limits.timeout_secs
     ));
-    lines.push(if install::disabled() {
-        "Installer: turned off (RTK_MCP_NO_INSTALL)".to_string()
-    } else {
-        match install::plan(&RealMachine, std::env::consts::OS, std::env::consts::ARCH) {
-            Ok(plan) => format!(
-                "Installer: install_rtk fetches RTK {} ({}) into {}{}",
-                install::TAG,
-                plan.asset.name,
-                plan.dir.display(),
-                if install::auto_enabled() {
-                    "; it also runs by itself at startup when RTK is missing (RTK_MCP_AUTO_INSTALL)"
-                } else {
-                    ""
-                }
-            ),
-            Err(reason) => format!("Installer: unavailable — {reason}"),
-        }
-    });
+    lines.push(installer_line());
     lines.extend(skipped.iter().map(|note| format!("Skipped: {note}")));
     lines.join("\n")
 }
@@ -1057,8 +1067,9 @@ fn status_report(skipped: &[String]) -> String {
 /// The sentence of the server instructions that points at `install_rtk`.
 macro_rules! install_sentence {
     () => {
-        "If a result says RTK is not installed, call install_rtk once: it downloads a \
-         SHA-256-verified release and run_command uses it at once."
+        "If a result says RTK is not installed, or get_rtk_status says it is out of date, call \
+         install_rtk once: it downloads a SHA-256-verified release (installing RTK, or upgrading \
+         the one in use to the latest) and run_command uses it at once."
     };
 }
 
@@ -1594,18 +1605,17 @@ async fn serve() -> anyhow::Result<()> {
 
     let server = RtkMcpServer::new();
 
-    // Opt-in (RTK_MCP_AUTO_INSTALL=1): fetch RTK in the background when none was found, so a
-    // fresh install needs nothing more than the Claude Desktop config entry. Commands that arrive
-    // before it is done simply run unfiltered.
-    if install::auto_enabled() && rtk::current().is_none() {
+    // Opt-in (RTK_MCP_AUTO_INSTALL=1): in the background, install RTK when none was found and
+    // upgrade the one that was found when it is older than the latest release, so that a fresh
+    // install needs nothing more than the Claude Desktop config entry. Commands that arrive
+    // before it is done simply run with what is there.
+    if install::auto_enabled() {
         tokio::spawn(async {
             match install::run().await {
-                Ok(done) => tracing::info!(
-                    "installed {} at {} ({})",
-                    done.rtk.version,
-                    done.rtk.path.display(),
-                    done.asset
-                ),
+                Ok(outcome @ install::Outcome::Left { .. }) => {
+                    tracing::warn!("RTK was not upgraded: {}", outcome.log_line());
+                }
+                Ok(outcome) => tracing::info!("{}", outcome.log_line()),
                 Err(reason) => tracing::warn!("automatic RTK install failed: {reason}"),
             }
         });
@@ -2496,10 +2506,10 @@ mod tests {
 
     /// What the server tells the model about itself on Linux and macOS. The text is spelled out
     /// here so that a change to it is a deliberate one: Claude Desktop shows it to the model as is.
-    const INSTRUCTIONS_SH: &str = r#"IMPORTANT: Use run_command for ALL shell execution instead of any built-in bash tool or other shell or terminal tool. RTK filters output to reduce token usage 60-90% for the commands it knows (git, cargo, go, docker, kubectl, aws, gh, curl, grep, find, ls, jq, pytest, ruff, mypy, tsc, vitest, rspec, rubocop and more, depending on the RTK version). Any other command runs as-is with full output: security scanners such as nmap, nuclei, httpx, subfinder, ffuf and sqlmap are not filtered, so cap their output yourself. Shell operators (|, &&, ||, ;, >, <, $VAR) are fully supported; commands run under `sh -c` (POSIX sh, not bash), so wrap bash-only syntax ({1..5}, [[ ]], <(...), &>) in `bash -c '...'`. Always pass 'cwd' so commands run in the right directory. Timeout is configurable via RTK_MCP_TIMEOUT_SECS (default 300s), the output cap via RTK_MCP_MAX_OUTPUT_KB (default 256KB). A background job (`cmd &`, `ssh -f`) must send its output to a file (`> log 2>&1 &`) or it is cut loose from the call after a few seconds. If RTK elides part of an output it prints a recall hint (`rtk recall <id>` or a saved-file path) — run it with run_command to get the full text. Prefix a command with RTK_DISABLED=1 to bypass filtering and get raw output. If a result says RTK is not installed, call install_rtk once: it downloads a SHA-256-verified release and run_command uses it at once."#;
+    const INSTRUCTIONS_SH: &str = r#"IMPORTANT: Use run_command for ALL shell execution instead of any built-in bash tool or other shell or terminal tool. RTK filters output to reduce token usage 60-90% for the commands it knows (git, cargo, go, docker, kubectl, aws, gh, curl, grep, find, ls, jq, pytest, ruff, mypy, tsc, vitest, rspec, rubocop and more, depending on the RTK version). Any other command runs as-is with full output: security scanners such as nmap, nuclei, httpx, subfinder, ffuf and sqlmap are not filtered, so cap their output yourself. Shell operators (|, &&, ||, ;, >, <, $VAR) are fully supported; commands run under `sh -c` (POSIX sh, not bash), so wrap bash-only syntax ({1..5}, [[ ]], <(...), &>) in `bash -c '...'`. Always pass 'cwd' so commands run in the right directory. Timeout is configurable via RTK_MCP_TIMEOUT_SECS (default 300s), the output cap via RTK_MCP_MAX_OUTPUT_KB (default 256KB). A background job (`cmd &`, `ssh -f`) must send its output to a file (`> log 2>&1 &`) or it is cut loose from the call after a few seconds. If RTK elides part of an output it prints a recall hint (`rtk recall <id>` or a saved-file path) — run it with run_command to get the full text. Prefix a command with RTK_DISABLED=1 to bypass filtering and get raw output. If a result says RTK is not installed, or get_rtk_status says it is out of date, call install_rtk once: it downloads a SHA-256-verified release (installing RTK, or upgrading the one in use to the latest) and run_command uses it at once."#;
 
     #[test]
-    fn sh_instructions_are_what_0_7_0_sends() {
+    fn sh_instructions_are_what_0_8_0_sends() {
         assert_eq!(instructions(&Shell::Sh), INSTRUCTIONS_SH);
     }
 
@@ -2649,18 +2659,89 @@ mod tests {
     }
 
     #[test]
-    fn an_old_rtk_gets_an_upgrade_note_and_a_current_one_does_not() {
+    fn an_rtk_older_than_the_pinned_release_is_called_out_of_date_in_the_status() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        let before = std::env::var_os("RTK_MCP_NO_INSTALL");
+        std::env::remove_var("RTK_MCP_NO_INSTALL");
         let with = |version: &str| rtk::Rtk {
             path: PathBuf::from("/x/rtk"),
             version: version.to_string(),
             origin: rtk::Origin::Path,
         };
         let pinned = format!("rtk {}", install::TAG.trim_start_matches('v'));
-        assert_eq!(upgrade_note(&with(&pinned)), "");
-        assert_eq!(upgrade_note(&with("rtk 99.0.0")), "");
-        assert_eq!(upgrade_note(&with("garbage")), "");
-        let note = upgrade_note(&with("rtk 0.34.3"));
-        assert!(note.contains("newer") && note.contains("/x/rtk"), "{note}");
+        assert_eq!(outdated_note(&with(&pinned)), None);
+        assert_eq!(outdated_note(&with("rtk 99.0.0")), None);
+        assert_eq!(outdated_note(&with("garbage")), None);
+        let note = outdated_note(&with("rtk 0.34.3")).expect("0.34.3 is old");
+        assert!(
+            note.starts_with("Update: RTK 0.34.3 is older than "),
+            "{note}"
+        );
+        assert!(note.ends_with("call install_rtk to upgrade it"), "{note}");
+        // with installing turned off the tool is not there to be called
+        std::env::set_var("RTK_MCP_NO_INSTALL", "1");
+        let note = outdated_note(&with("rtk 0.34.3")).expect("still old");
+        assert!(!note.contains("install_rtk"), "{note}");
+        match before {
+            Some(v) => std::env::set_var("RTK_MCP_NO_INSTALL", v),
+            None => std::env::remove_var("RTK_MCP_NO_INSTALL"),
+        }
+    }
+
+    #[test]
+    fn the_installer_line_says_what_install_rtk_does() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        let saved: Vec<_> = [
+            "RTK_MCP_NO_INSTALL",
+            "RTK_MCP_RTK_VERSION",
+            "RTK_MCP_AUTO_INSTALL",
+        ]
+        .map(|name| (name, std::env::var_os(name)))
+        .to_vec();
+        for (name, _) in &saved {
+            std::env::remove_var(name);
+        }
+        let latest = installer_line();
+        assert!(
+            latest.starts_with("Installer: install_rtk installs the latest RTK release ("),
+            "{latest}"
+        );
+        assert!(latest.contains(install::TAG), "{latest}");
+        assert!(
+            latest.contains("upgrades an older RTK in place"),
+            "{latest}"
+        );
+        assert!(!latest.contains("RTK_MCP_AUTO_INSTALL"), "{latest}");
+        std::env::set_var("RTK_MCP_RTK_VERSION", "pinned");
+        let pinned = installer_line();
+        assert!(
+            pinned.starts_with(&format!(
+                "Installer: install_rtk installs RTK {} (",
+                install::TAG
+            )),
+            "{pinned}"
+        );
+        assert!(pinned.contains("RTK_MCP_RTK_VERSION=pinned"), "{pinned}");
+        std::env::set_var("RTK_MCP_RTK_VERSION", "nonsense");
+        let bad = installer_line();
+        assert!(
+            bad.starts_with("Installer: unavailable — RTK_MCP_RTK_VERSION=nonsense"),
+            "{bad}"
+        );
+        std::env::remove_var("RTK_MCP_RTK_VERSION");
+        std::env::set_var("RTK_MCP_AUTO_INSTALL", "1");
+        assert!(installer_line().ends_with("(RTK_MCP_AUTO_INSTALL)"));
+        std::env::set_var("RTK_MCP_NO_INSTALL", "1");
+        assert_eq!(
+            installer_line(),
+            "Installer: turned off (RTK_MCP_NO_INSTALL)"
+        );
+        for (name, value) in saved {
+            match value {
+                Some(v) => std::env::set_var(name, v),
+                None => std::env::remove_var(name),
+            }
+        }
     }
 
     #[test]

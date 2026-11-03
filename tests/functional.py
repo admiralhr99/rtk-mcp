@@ -16,6 +16,7 @@ here reads or writes your real RTK data or Claude settings (on Windows RTK finds
 through the profile folder, not through HOME, so there the runner's own is used). Exit status 1
 on any failure.
 """
+import hashlib
 import json
 import os
 import queue
@@ -48,6 +49,16 @@ ARGS = [a for a in sys.argv[1:] if not a.startswith("--")]
 INSTALLED = "--installed" in sys.argv[1:]  # check an install.ps1 layout instead of running everything
 BINARY = os.path.abspath(ARGS[0] if ARGS else "target/release/rtk-mcp" + (".exe" if IS_WINDOWS else ""))
 FAILURES = []
+# A proxy (and its CA bundle) that the machine needs to reach GitHub is not part of the isolation:
+# curl, inside the server, has to see it for the tests that download.
+PROXY_VARIABLES = (
+    "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy",
+    "NO_PROXY", "no_proxy", "CURL_CA_BUNDLE", "SSL_CERT_FILE", "SSL_CERT_DIR",
+)
+# Nothing listens on port 9, so a server given this proxy cannot reach GitHub, at once and without
+# waiting for a timeout. Both spellings: curl prefers the lower-case one.
+DEAD_PROXY = {name: "http://127.0.0.1:9" for name in ("HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy")}
+DEAD_PROXY.update({"NO_PROXY": "", "no_proxy": ""})
 
 # Things that differ between a POSIX shell on Linux/macOS and Git Bash on Windows.
 PWD = "pwd -W" if IS_WINDOWS else "pwd"  # Git Bash: `pwd -W` prints the Windows form of the directory
@@ -123,6 +134,9 @@ class Server:
             "LANG": "C.UTF-8",
             "RTK_FUNC_TOKEN": "pipe-ok",
         })
+        for name in PROXY_VARIABLES:
+            if name in os.environ:
+                self.env.setdefault(name, os.environ[name])
         if IS_WINDOWS:
             self.env.update({
                 "USERPROFILE": self.home,
@@ -276,7 +290,8 @@ def read_pid(pidfile, seconds=0):
 
 def test_with_rtk(version):
     marker = None
-    s = Server(deny=["Bash(touch:*)", "Bash(git push:*)"])
+    # pinned: with an RTK older than the pinned release, install_rtk would go and fetch the latest
+    s = Server(deny=["Bash(touch:*)", "Bash(git push:*)"], extra_env={"RTK_MCP_RTK_VERSION": "pinned"})
     try:
         # --- handshake and tool surface -------------------------------------------------------
         check("initialize reports rtk-mcp", s.init["serverInfo"]["name"] == "rtk-mcp", s.init)
@@ -309,8 +324,8 @@ def test_with_rtk(version):
         check("stats, status, recall, config and rewrite tools are flagged read-only", all(
             tools[n]["annotations"].get("readOnlyHint") is True for n in READ_ONLY_TOOLS))
         install_annotations = tools["install_rtk"]["annotations"]
-        check("install_rtk is flagged non-destructive, idempotent and open-world",
-              install_annotations.get("destructiveHint") is False
+        check("install_rtk is flagged destructive (it can replace RTK), idempotent and open-world",
+              install_annotations.get("destructiveHint") is True
               and install_annotations.get("idempotentHint") is True
               and install_annotations.get("openWorldHint") is True, install_annotations)
         check("startup log names the detected RTK", "detected" in s.log() and "rtk " in s.log(), s.log()[-300:])
@@ -433,9 +448,18 @@ def test_with_rtk(version):
             err, text = s.call("get_rtk_recall", list=True)
             check("recall on an RTK that predates it says so instead of running it",
                   err and "predates `rtk recall`" in text and "0.49.0" in text, text)
-        err, text = s.call("install_rtk")
-        check("install_rtk with RTK present installs nothing and says where RTK is",
-              not err and "already installed" in text and ("rtk %d.%d.%d" % version) in text, text)
+        err, text = s.call("get_rtk_status")
+        if version >= pinned_version():
+            check("status does not call an up-to-date RTK out of date", "Update:" not in text, text)
+            err, text = s.call("install_rtk")
+            check("install_rtk with an up-to-date RTK installs nothing and says where RTK is",
+                  not err and "already installed and up to date" in text and ("rtk %d.%d.%d" % version) in text
+                  and "Nothing to install." in text, text)
+        else:
+            check("status calls an RTK older than the pinned release out of date and names the tool that fixes it",
+                  ("Update: RTK %d.%d.%d is older than " % version) in text
+                  and "call install_rtk to upgrade it" in text, text)
+            skip("install_rtk with an up-to-date RTK", "this RTK is older than the pinned release, so it would be upgraded")
 
         check("server still alive and quiet", s.alive())
     finally:
@@ -631,6 +655,37 @@ def tool_version():
         return re.search(r'tag \{\s*\(\) => \{\s*"(v\d+\.\d+\.\d+)"', f.read().replace("\n", " ")).group(1)
 
 
+def pinned_version():
+    """The RTK release install_rtk is pinned to, as a tuple."""
+    return tuple(int(n) for n in tool_version().lstrip("v").split("."))
+
+
+def latest_release_online(tries=3):
+    """The release GitHub calls the latest RTK, as a tuple, or None when this machine cannot ask.
+
+    Asked the way the server asks (the redirect of releases/latest), but by this script, so the tests
+    know what to expect from the server. A sandbox whose proxy refuses that page gets None; the
+    server then installs the pinned release and says GitHub could not be asked."""
+    curl = shutil.which("curl")
+    if not curl:
+        return None
+    for attempt in range(tries):
+        if attempt:
+            time.sleep(3)
+        try:
+            got = subprocess.run(
+                [curl, "-sS", "--max-time", "30", "--output", os.devnull, "--write-out", "%{http_code} %{redirect_url}",
+                 "https://github.com/rtk-ai/rtk/releases/latest"],
+                capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        found = re.fullmatch(r"30\d https://github\.com/rtk-ai/rtk/releases/tag/v(\d+)\.(\d+)\.(\d+)",
+                             got.stdout.strip())
+        if found:
+            return tuple(int(n) for n in found.groups())
+    return None
+
+
 def test_without_rtk():
     # A PATH that cannot contain rtk: only the system dirs.
     path = BASIC_PATH
@@ -652,7 +707,8 @@ def test_without_rtk():
         err, text = s.call("get_rtk_status")
         check("status says RTK is missing and what the installer would fetch",
               not err and "RTK: not installed" in text and "Mode: without RTK" in text
-              and ("Installer: install_rtk fetches RTK " + tool_version()) in text, text)
+              and "Installer: install_rtk installs the latest RTK release (" in text
+              and tool_version() in text and "upgrades an older RTK in place" in text, text)
         for tool, args in (("get_rtk_recall", {"list": True}), ("get_rtk_config", {}),
                            ("get_rtk_rewrite", {"command": "git status"})):
             err, text = s.call(tool, **args)
@@ -767,16 +823,22 @@ def test_rtk_locations():
         shutil.rmtree(custom, ignore_errors=True)
 
     # --- RTK appears after the server has started ------------------------------------------------
-    s = Server(path=BASIC_PATH)
+    s = Server(path=BASIC_PATH, extra_env={"RTK_MCP_RTK_VERSION": "pinned"})
     try:
         err, text = s.call("get_rtk_status")
         check("before RTK exists, the status says so", not err and "RTK: not installed" in text, text)
         target = os.path.join(s.home, ".local", "bin", RTK_EXE)
         os.makedirs(os.path.dirname(target))
         shutil.copy2(real, target)
-        err, text = s.call("install_rtk")
-        check("install_rtk finds an RTK that was put there by hand, and installs nothing",
-              not err and "already installed" in text and "usual install directory" in text, text)
+        if rtk_version() >= pinned_version():
+            err, text = s.call("install_rtk")
+            check("install_rtk finds an RTK that was put there by hand, and installs nothing",
+                  not err and "already installed" in text and "usual install directory" in text, text)
+        else:
+            # an RTK older than the pinned release would be upgraded by install_rtk; looking is enough here
+            err, text = s.call("get_rtk_status")
+            check("get_rtk_status finds an RTK that was put there by hand",
+                  not err and "found in a usual install directory" in text, text)
         ls_works_through_rtk(s, "added while running")
     finally:
         s.close()
@@ -812,8 +874,7 @@ def network_enabled(version):
         return True
     if NETWORK_SETTING in ("0", "false"):
         return False
-    pinned = tuple(int(n) for n in tool_version().lstrip("v").split("."))
-    return os.environ.get("GITHUB_ACTIONS") == "true" and version == pinned
+    return os.environ.get("GITHUB_ACTIONS") == "true" and version == pinned_version()
 
 
 def test_pinned_checksums():
@@ -850,7 +911,7 @@ def test_install_network(version):
     root = tempfile.mkdtemp(prefix="rtk-mcp-install-")
     bindir = os.path.join(root, "bin")
     exe = os.path.join(bindir, RTK_EXE)
-    s = Server(path=BASIC_PATH, extra_env={"RTK_MCP_INSTALL_DIR": bindir})
+    s = Server(path=BASIC_PATH, extra_env={"RTK_MCP_INSTALL_DIR": bindir, "RTK_MCP_RTK_VERSION": "pinned"})
     try:
         started = time.time()
         err, text = s.call("install_rtk", _timeout=240)
@@ -878,7 +939,8 @@ def test_install_network(version):
         err, text = s.call("get_rtk_savings", format="json")
         check("the stats tools use the installed RTK", not err and '"summary"' in text, text)
         err, text = s.call("install_rtk")
-        check("a second install_rtk finds it already installed", not err and "already installed" in text, text)
+        check("a second install_rtk finds it already installed and up to date",
+              not err and "already installed and up to date" in text, text)
         err, text = s.call("run_command", command="echo after install")
         check("no 'RTK is not installed' note once RTK is there",
               not err and "after install" in text and "RTK is not installed" not in text, text)
@@ -900,7 +962,8 @@ def test_install_network(version):
     bindir = os.path.join(root, "bin")
     exe = os.path.join(bindir, RTK_EXE)
     s = Server(path=BASIC_PATH, extra_env={
-        "RTK_MCP_INSTALL_DIR": bindir, "RTK_MCP_AUTO_INSTALL": "1", "RTK_MCP_RTK_EDITION": "oss"})
+        "RTK_MCP_INSTALL_DIR": bindir, "RTK_MCP_AUTO_INSTALL": "1", "RTK_MCP_RTK_EDITION": "oss",
+        "RTK_MCP_RTK_VERSION": "pinned"})
     try:
         text = ""
         deadline = time.time() + 180
@@ -916,6 +979,325 @@ def test_install_network(version):
     finally:
         s.close()
         shutil.rmtree(root, ignore_errors=True)
+
+
+def sha256_of(path):
+    with open(path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+
+def version_of(path):
+    """The (major, minor, patch) that the RTK at `path` reports, or None."""
+    try:
+        out = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=30).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    numbers = re.findall(r"\d+", out)
+    return tuple(int(n) for n in numbers[:3]) if len(numbers) >= 3 else None
+
+
+def write_fake_rtk(path, version_line="rtk 0.9.0"):
+    """A program that passes the server's probe as an RTK reporting `version_line`: `rewrite` answers
+    the way RTK does for a command it has a filter for (`git status`) and has no answer for any other.
+    A shell script, so not for Windows."""
+    script = (
+        "#!/bin/sh\n"
+        'case "$1" in\n'
+        "  --version) echo '" + version_line + "' ;;\n"
+        '  rewrite) if [ "$3" = "git status" ]; then echo \'rtk git status\'; exit 3; fi; exit 1 ;;\n'
+        "  *) exit 1 ;;\n"
+        "esac\n"
+    )
+    with open(path, "w") as f:
+        f.write(script)
+    os.chmod(path, 0o755)
+
+
+def test_install_offline():
+    """install_rtk when GitHub cannot be reached or there is nothing to do: nothing is downloaded, so
+    these run everywhere. A fake RTK (a shell script that passes the server's probe) stands in for an
+    old one, so most of them need a POSIX shell."""
+    # --- a setting that makes no sense --------------------------------------------------------------
+    s = Server(path=BASIC_PATH, extra_env={"RTK_MCP_RTK_VERSION": "nonsense"})
+    try:
+        err, text = s.call("install_rtk")
+        check("RTK_MCP_RTK_VERSION=nonsense is refused, naming the two values that work",
+              err and "RTK_MCP_RTK_VERSION=nonsense" in text and "`latest`" in text and "`pinned`" in text, text)
+        err, text = s.call("get_rtk_status")
+        check("the status reports the bad setting",
+              not err and "Installer: unavailable" in text and "RTK_MCP_RTK_VERSION=nonsense" in text, text)
+    finally:
+        s.close()
+
+    # --- GitHub cannot be reached and there is no RTK -----------------------------------------------
+    if rtk_version(BASIC_PATH) is None and not usual_rtk_places():
+        root = tempfile.mkdtemp(prefix="rtk-mcp-offline-")
+        bindir = os.path.join(root, "bin")
+        s = Server(path=BASIC_PATH, extra_env=dict(DEAD_PROXY, RTK_MCP_INSTALL_DIR=bindir))
+        try:
+            err, text = s.call("install_rtk", _timeout=120)
+            check("install_rtk without GitHub says what failed (it fell back on the pinned release) and installs nothing",
+                  err and ("downloading https://github.com/rtk-ai/rtk/releases/download/%s/" % tool_version()) in text
+                  and not os.path.exists(os.path.join(bindir, RTK_EXE)), text)
+            err, text = s.call("run_command", command="echo carries on")
+            check("the server carries on", not err and "carries on" in text, text)
+        finally:
+            s.close()
+            shutil.rmtree(root, ignore_errors=True)
+    else:
+        skip("install_rtk without GitHub and without RTK", "rtk is installed in a directory the server always looks in")
+
+    if IS_WINDOWS:
+        skip("install_rtk with a fake old RTK", "the fake is a shell script")
+        return
+
+    # --- fake RTKs of different ages, GitHub unreachable ------------------------------------------------
+    root = tempfile.mkdtemp(prefix="rtk-mcp-fake-")
+
+    def fake(name, version_line):
+        directory = os.path.join(root, name)
+        os.makedirs(directory)
+        path = os.path.join(directory, "rtk")
+        write_fake_rtk(path, version_line)
+        return path
+
+    def server(path):
+        return Server(path=BASIC_PATH, extra_env=dict(DEAD_PROXY, RTK_MCP_RTK_PATH=path))
+
+    try:
+        newer = fake("newer", "rtk 99.0.0")
+        before = sha256_of(newer)
+        s = server(newer)
+        try:
+            err, text = s.call("install_rtk", _timeout=120)
+            check("an RTK newer than the release is left alone, and an unreachable GitHub is not an error",
+                  not err and "already installed and up to date" in text and "rtk 99.0.0" in text
+                  and "GitHub could not be asked for the latest" in text, text)
+            check("... its file is untouched", sha256_of(newer) == before)
+            err, text = s.call("get_rtk_status")
+            check("the status does not call it out of date", not err and "Update:" not in text, text)
+        finally:
+            s.close()
+
+        old = fake("old", "rtk 0.9.0")
+        before = sha256_of(old)
+        s = server(old)
+        try:
+            err, text = s.call("get_rtk_status")
+            check("the status calls an old RTK out of date and names the tool that fixes it",
+                  not err and ("Update: RTK 0.9.0 is older than %s" % tool_version().lstrip("v")) in text
+                  and "call install_rtk to upgrade it" in text, text)
+            err, text = s.call("install_rtk", _timeout=120)
+            check("a download that fails leaves the old RTK as it was",
+                  err and "downloading" in text and sha256_of(old) == before, text)
+            check("... and no temporary file beside it", os.listdir(os.path.dirname(old)) == ["rtk"],
+                  os.listdir(os.path.dirname(old)))
+            err, text = s.call("run_command", command="echo still here")
+            check("... and the server carries on", not err and "still here" in text, text)
+        finally:
+            s.close()
+
+        behind = fake("behind-the-link", "rtk 0.9.0")
+        linkdir = os.path.join(root, "bin")
+        os.makedirs(linkdir)
+        link = os.path.join(linkdir, "rtk")
+        os.symlink(behind, link)
+        before = sha256_of(behind)
+        s = server(link)
+        try:
+            err, text = s.call("install_rtk", _timeout=120)
+            check("an old RTK behind a symbolic link is reported, not replaced",
+                  err and text.startswith("RTK was not upgraded.") and "is a symbolic link" in text
+                  and "package manager" in text, text)
+            check("... the link and the file behind it are as they were",
+                  os.path.islink(link) and sha256_of(behind) == before and os.listdir(linkdir) == ["rtk"])
+        finally:
+            s.close()
+
+        strange = fake("strange", "rtk dev-build")
+        s = server(strange)
+        try:
+            err, text = s.call("install_rtk", _timeout=120)
+            check("an RTK whose version cannot be read is left alone",
+                  err and text.startswith("RTK was not upgraded.") and "cannot be compared" in text, text)
+        finally:
+            s.close()
+
+        if hasattr(os, "geteuid") and os.geteuid() != 0:
+            locked = fake("locked", "rtk 0.9.0")
+            os.chmod(os.path.dirname(locked), 0o555)
+            s = server(locked)
+            try:
+                err, text = s.call("install_rtk", _timeout=120)
+                check("an old RTK in a directory that cannot be written to is reported, not replaced",
+                      err and text.startswith("RTK was not upgraded.") and "cannot write in" in text, text)
+            finally:
+                s.close()
+                os.chmod(os.path.dirname(locked), 0o755)
+        else:
+            skip("an old RTK in a read-only directory", "running as root, which can write anywhere")
+    finally:
+        for directory, _, _ in os.walk(root):
+            os.chmod(directory, 0o755)
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def upgrade_network_enabled():
+    """Do the tests that upgrade an RTK from GitHub run? RTK_MCP_TEST_NETWORK=1 asks for them, =0
+    rules them out, and on GitHub Actions they run in every job."""
+    if NETWORK_SETTING in ("1", "true"):
+        return True
+    if NETWORK_SETTING in ("0", "false"):
+        return False
+    return os.environ.get("GITHUB_ACTIONS") == "true"
+
+
+def test_upgrade_network(version):
+    """The real thing, upgrading: an old RTK is replaced in place by the latest release from GitHub.
+
+    The old RTK is a copy of this runner's own where that one is older than the pinned release (every
+    system gets this from the 0.34 and 0.49 jobs), else a fake one."""
+    if not upgrade_network_enabled():
+        skip("upgrading RTK from GitHub", "set RTK_MCP_TEST_NETWORK=1 to download RTK")
+        return
+    pinned = pinned_version()
+    latest = latest_release_online()
+    if latest is None and os.environ.get("GITHUB_ACTIONS") == "true":
+        # a runner can always ask, so this is worth a failure rather than a quiet fallback
+        check("GitHub names the latest RTK release (releases/latest redirects to a tag)", False,
+              "the runner could not read it")
+        return
+    expected = latest or pinned
+    asked = "the latest release" if latest else "GitHub could not be asked for the latest"
+    if latest is None:
+        skip("upgrading to the latest release",
+             "GitHub's releases/latest page cannot be read from here, so the pinned release is expected")
+    runner_rtk = shutil.which("rtk")
+    root = tempfile.mkdtemp(prefix="rtk-mcp-upgrade-")
+    try:
+        directory = os.path.join(root, "old")
+        os.makedirs(directory)
+        old = os.path.join(directory, RTK_EXE)
+        fake = False
+        if version is not None and version < pinned and runner_rtk:
+            shutil.copy2(runner_rtk, old)
+            old_number = ".".join(map(str, version))
+            label = "a copy of RTK " + old_number
+            untouched = (runner_rtk, sha256_of(runner_rtk))
+        elif not IS_WINDOWS:
+            write_fake_rtk(old, "rtk 0.9.0")
+            old_number, label, fake, untouched = "0.9.0", "a fake RTK 0.9.0", True, None
+        else:
+            skip("upgrading RTK from GitHub", "this runner's RTK is the pinned release, and a fake needs a shell script")
+            return
+
+        s = Server(path=BASIC_PATH, extra_env={"RTK_MCP_RTK_PATH": old})
+        try:
+            err, text = s.call("get_rtk_status")
+            check(label + ": the status calls it out of date",
+                  not err and ("Update: RTK %s is older than " % old_number) in text, text)
+            started = time.time()
+            err, text = s.call("install_rtk", _timeout=240)
+            print("      (upgrade took %.1fs)" % (time.time() - started))
+            check(label + ": install_rtk upgrades it in place",
+                  not err and text.startswith("Upgraded RTK from %s to " % old_number) and old in text, text)
+            new = version_of(old)
+            check("the file now holds the latest RTK release" if latest else "the file now holds the pinned RTK release",
+                  new == expected, (new, expected))
+            check("nothing else was written beside it (no staged file, no licence files)",
+                  os.listdir(directory) == [RTK_EXE], os.listdir(directory))
+            if not IS_WINDOWS:
+                check("it is executable", os.access(old, os.X_OK))
+            if new is None:
+                return
+            err, text = s.call("get_rtk_status")
+            check("the status shows the new version at the same place, no longer out of date",
+                  not err and ("RTK: rtk %d.%d.%d at %s" % (new + (old,))) in text and "Update:" not in text, text)
+            err, text = s.call("run_command", command="rtk --version")
+            check("commands run through the new RTK without a restart",
+                  not err and text.strip() == "rtk %d.%d.%d" % new, text)
+            err, text = s.call("install_rtk", _timeout=120)
+            check("a second install_rtk finds it up to date",
+                  not err and "already installed and up to date" in text and asked in text, text)
+        finally:
+            s.close()
+        if untouched:
+            check("the RTK this test runs against was not touched", sha256_of(untouched[0]) == untouched[1])
+
+        if fake:
+            # RTK_MCP_AUTO_INSTALL does the same at startup, with nobody asking
+            auto = os.path.join(root, "auto")
+            os.makedirs(auto)
+            old = os.path.join(auto, "rtk")
+            write_fake_rtk(old, "rtk 0.9.0")
+            s = Server(path=BASIC_PATH, extra_env={"RTK_MCP_RTK_PATH": old, "RTK_MCP_AUTO_INSTALL": "1"})
+            try:
+                text = ""
+                deadline = time.time() + 180
+                while time.time() < deadline:
+                    err, text = s.call("get_rtk_status")
+                    if "RTK: rtk 0.9.0" not in text:
+                        break
+                    time.sleep(2)
+                new = version_of(old)
+                check("RTK_MCP_AUTO_INSTALL upgrades an old RTK at startup",
+                      new == expected and ("RTK: rtk %d.%d.%d at %s" % (new + (old,))) in text, text)
+                check("the log says so", "upgraded rtk 0.9.0 to rtk " in s.log(), s.log()[-400:])
+            finally:
+                s.close()
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_install_latest_network(version):
+    """The default channel against GitHub: with no RTK on the machine, the latest release is installed,
+    with the hash from its own checksums.txt (or the pinned one, when the latest is the pinned release)."""
+    if not network_enabled(version):
+        skip("install_rtk of the latest release", "set RTK_MCP_TEST_NETWORK=1 to download RTK")
+        return
+    if rtk_version(BASIC_PATH) is not None or usual_rtk_places():
+        skip("install_rtk of the latest release", "rtk is installed in a directory the server always looks in")
+        return
+    pinned = pinned_version()
+    latest = latest_release_online()
+    if latest is None and os.environ.get("GITHUB_ACTIONS") == "true":
+        check("GitHub names the latest RTK release (releases/latest redirects to a tag)", False,
+              "the runner could not read it")
+        return
+    expected = latest or pinned
+    asked = "the latest release" if latest else "GitHub could not be asked for the latest"
+    if latest is None:
+        skip("install_rtk of the latest release",
+             "GitHub's releases/latest page cannot be read from here, so the pinned release is expected")
+    root = tempfile.mkdtemp(prefix="rtk-mcp-latest-")
+    bindir = os.path.join(root, "bin")
+    exe = os.path.join(bindir, RTK_EXE)
+    s = Server(path=BASIC_PATH, extra_env={"RTK_MCP_INSTALL_DIR": bindir})
+    try:
+        err, text = s.call("get_rtk_status")
+        check("the status says the installer goes for the latest release",
+              not err and "Installer: install_rtk installs the latest RTK release (" in text, text)
+        err, text = s.call("install_rtk", _timeout=240)
+        found = re.match(r"Installed rtk (\d+)\.(\d+)\.(\d+) at ", text)
+        number = tuple(int(n) for n in found.groups()) if found else None
+        check("install_rtk installs the latest release" if latest else "install_rtk falls back on the pinned release",
+              not err and number == expected and asked in text, text)
+        check("... checked against a hash from rtk-mcp or from the release's own checksums.txt",
+              ("pinned in rtk-mcp" in text) if expected == pinned else ("checksums.txt published with v" in text), text)
+        check("the file is a working RTK of that version", number is not None and version_of(exe) == number,
+              (number, version_of(exe) if os.path.isfile(exe) else None))
+        check("nothing else was written beside it", os.path.isdir(bindir) and os.listdir(bindir) == [RTK_EXE],
+              os.listdir(bindir) if os.path.isdir(bindir) else "no directory")
+        err, text = s.call("run_command", command="rtk --version")
+        check("commands run through it without a restart",
+              not err and number is not None and text.strip() == "rtk %d.%d.%d" % number, text)
+        err, text = s.call("install_rtk", _timeout=120)
+        check("a second install_rtk finds it up to date",
+              not err and "already installed and up to date" in text and asked in text, text)
+    finally:
+        s.close()
+        shutil.rmtree(root, ignore_errors=True)
+
 
 
 def windows_default_shell():
@@ -1204,6 +1586,9 @@ def main():
         test_without_rtk()
         test_rtk_locations()
         test_install_network(version)
+        test_install_latest_network(version)
+        test_install_offline()
+        test_upgrade_network(version)
     if IS_WINDOWS:
         test_windows(version, bash_path)
     print()
